@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -9,7 +11,7 @@ use clap::{Parser, Subcommand};
 use kube::api::{ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{Api, Client};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
@@ -44,9 +46,15 @@ use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
 #[derive(Parser)]
 #[command(name = "pgroles", version, about, long_about = None)]
 struct Cli {
+    /// Use AKS Workload Identity for Azure PostgreSQL Flexible Server.
+    /// Requires AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE.
+    #[arg(long, global = true, env = "PGROLES_AZURE_WORKLOAD_IDENTITY")]
+    azure_workload_identity: bool,
     #[command(subcommand)]
     command: Commands,
 }
+
+static AZURE_WORKLOAD_IDENTITY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Subcommand)]
 enum Commands {
@@ -441,6 +449,7 @@ const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
 const LAST_HANDLED_RECONCILE_AT_STATUS_FIELD: &str = "lastHandledReconcileAt";
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    AZURE_WORKLOAD_IDENTITY.store(cli.azure_workload_identity, Ordering::Relaxed);
     match cli.command {
         Commands::Validate { file, bundle } => {
             cmd_validate(file.as_deref(), bundle.as_deref())?;
@@ -2171,9 +2180,26 @@ async fn connect_db(database_url: &str) -> Result<PgPool> {
     // The CLI is a one-shot tool, so prefer a single pooled connection. This
     // avoids hopping across different backends when a hostname resolves to
     // multiple PostgreSQL servers.
+    let mut options =
+        PgConnectOptions::from_str(database_url).context("invalid PostgreSQL connection URL")?;
+    if AZURE_WORKLOAD_IDENTITY.load(Ordering::Relaxed) {
+        let parsed = reqwest::Url::parse(database_url)
+            .context("Azure authentication requires a PostgreSQL URL")?;
+        anyhow::ensure!(
+            parsed.password().is_none() && !parsed.query_pairs().any(|(key, _)| key == "password"),
+            "Azure Workload Identity requires a connection URL without a password"
+        );
+        if !parsed.query_pairs().any(|(key, _)| key == "sslmode") {
+            options = options.ssl_mode(PgSslMode::VerifyFull);
+        }
+        let token = pgroles_inspect::azure_auth::fetch_workload_identity_token()
+            .await
+            .context("could not acquire Azure PostgreSQL access token")?;
+        options = options.password(&token.value);
+    }
     PgPoolOptions::new()
         .max_connections(1)
-        .connect(database_url)
+        .connect_with(options)
         .await
         .context("failed to connect to database")
 }

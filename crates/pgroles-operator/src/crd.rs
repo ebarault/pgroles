@@ -5,8 +5,9 @@
 //! database connection and reconciliation scheduling.
 
 use kube::{CustomResource, KubeSchema};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pgroles_core::bounds::*;
@@ -561,9 +562,8 @@ pub struct ConnectionParams {
 }
 
 /// Provider-backed authentication for `connection.params`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "type")]
-#[schemars(transform = schemars::transform::RecursiveTransform(describe_auth_tag))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ConnectionAuth {
     /// Fetch a Cloud SQL IAM database login token using the GKE metadata
     /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
@@ -578,18 +578,34 @@ pub enum ConnectionAuth {
         #[serde(default)]
         scope: Option<String>,
     },
+    /// Exchange the AKS projected service account token for an Entra access
+    /// token accepted by Azure Database for PostgreSQL Flexible Server.
+    #[serde(rename = "azure_workload_identity")]
+    AzureWorkloadIdentity {},
 }
 
-fn describe_auth_tag(schema: &mut schemars::Schema) {
-    if let Some(tag) = schema
-        .get_mut("properties")
-        .and_then(|p| p.get_mut("type"))
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        tag.insert(
-            "description".into(),
-            serde_json::json!("Provider authentication mechanism."),
-        );
+impl JsonSchema for ConnectionAuth {
+    fn schema_name() -> Cow<'static, str> {
+        "ConnectionAuth".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        // Kubernetes requires a property shared by enum variants to have an
+        // identical schema in every branch. A single structural schema keeps
+        // the discriminator stable; runtime validation checks GCP-only fields.
+        json_schema!({
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["gcp_workload_identity", "azure_workload_identity"],
+                    "description": "Provider authentication mechanism."
+                },
+                "impersonateServiceAccount": {"type": "string", "nullable": true, "description": "Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity."},
+                "scope": {"type": "string", "nullable": true, "description": "OAuth scope requested for the access token."}
+            }
+        })
     }
 }
 
@@ -599,6 +615,7 @@ impl ConnectionAuth {
             Self::GcpWorkloadIdentity { scope, .. } => scope
                 .as_deref()
                 .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE),
+            Self::AzureWorkloadIdentity { .. } => DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE,
         }
     }
 
@@ -608,6 +625,7 @@ impl ConnectionAuth {
                 impersonate_service_account,
                 ..
             } => impersonate_service_account.as_deref(),
+            Self::AzureWorkloadIdentity { .. } => None,
         }
     }
 
@@ -623,7 +641,57 @@ impl ConnectionAuth {
                     .as_deref()
                     .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE)
             ),
+            Self::AzureWorkloadIdentity { .. } => "azure_workload_identity".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod azure_auth_tests {
+    use super::*;
+
+    #[test]
+    fn azure_auth_round_trips_and_has_distinct_cache_key() {
+        let auth: ConnectionAuth =
+            serde_json::from_str(r#"{"type":"azure_workload_identity"}"#).unwrap();
+        assert_eq!(auth, ConnectionAuth::AzureWorkloadIdentity {});
+        assert_eq!(auth.cache_key(), "azure_workload_identity");
+        assert_eq!(
+            serde_json::to_value(auth).unwrap(),
+            serde_json::json!({"type":"azure_workload_identity"})
+        );
+        assert!(
+            serde_json::from_str::<ConnectionAuth>(
+                r#"{"type":"azure_workload_identity","scope":"unexpected"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn azure_connection_needs_no_password_and_rejects_one() {
+        let params: ConnectionParams = serde_yaml::from_str(
+            "host: server.postgres.database.azure.com\ndbname: postgres\nusername: pgroles-operator\nauth:\n  type: azure_workload_identity\n",
+        )
+        .unwrap();
+        let connection = |params| ConnectionSpec {
+            secret_ref: None,
+            secret_key: None,
+            params: Some(params),
+            require_physical_identity: None,
+        };
+        assert!(
+            super::tests::spec_with_connection(connection(params.clone()))
+                .validate_connection_spec()
+                .is_ok()
+        );
+        let mut with_password = params;
+        with_password.password = Some("static-password".into());
+        assert!(matches!(
+            super::tests::spec_with_connection(connection(with_password))
+                .validate_connection_spec(),
+            Err(ConnectionValidationError::AuthWithPassword)
+        ));
     }
 }
 
@@ -2135,6 +2203,7 @@ impl PostgresPolicySpec {
                                 });
                             }
                         }
+                        ConnectionAuth::AzureWorkloadIdentity { .. } => {}
                     }
                 } else {
                     validate_required_field("password", &params.password, &params.password_secret)?;
@@ -3742,7 +3811,7 @@ mod tests {
     }
 
     /// Helper to build a minimal spec with the given connection and no roles/grants.
-    fn spec_with_connection(connection: ConnectionSpec) -> PostgresPolicySpec {
+    pub(super) fn spec_with_connection(connection: ConnectionSpec) -> PostgresPolicySpec {
         PostgresPolicySpec {
             connection,
             interval: "5m".into(),

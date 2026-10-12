@@ -28,16 +28,9 @@
                 "auth": {
                   "description": "Provider-backed authentication for connections that use short-lived\ncredentials instead of a static PostgreSQL password.",
                   "nullable": true,
-                  "oneOf": [
-                    {
-                      "required": [
-                        "type"
-                      ]
-                    }
-                  ],
                   "properties": {
                     "impersonateServiceAccount": {
-                      "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity.",
+                      "description": "Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity.",
                       "nullable": true,
                       "type": "string"
                     },
@@ -49,11 +42,15 @@
                     "type": {
                       "description": "Provider authentication mechanism.",
                       "enum": [
-                        "gcp_workload_identity"
+                        "gcp_workload_identity",
+                        "azure_workload_identity"
                       ],
                       "type": "string"
                     }
                   },
+                  "required": [
+                    "type"
+                  ],
                   "type": "object"
                 },
                 "dbname": {

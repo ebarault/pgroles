@@ -27,6 +27,7 @@ jiff = "0.2.23"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -652,8 +652,18 @@ impl OperatorContext {
             }
 
             let (password, token_expires_at) = if let Some(auth) = &params.auth {
-                let token = self.gcp_token_provider.fetch_token(auth).await?;
-                (token.token, Some(token.expires_at))
+                match auth {
+                    ConnectionAuth::GcpWorkloadIdentity { .. } => {
+                        let token = self.gcp_token_provider.fetch_token(auth).await?;
+                        (token.token, Some(token.expires_at))
+                    }
+                    ConnectionAuth::AzureWorkloadIdentity { .. } => {
+                        let token = pgroles_inspect::azure_auth::fetch_workload_identity_token()
+                            .await
+                            .map_err(ContextError::AzureAuth)?;
+                        (token.value, Some(token.expires_at))
+                    }
+                }
             } else {
                 let password = self
                     .resolve_param(namespace, &params.password, &params.password_secret)
@@ -680,7 +690,12 @@ impl OperatorContext {
             let ssl_mode = self
                 .resolve_param(namespace, &params.ssl_mode, &params.ssl_mode_secret)
                 .await?
-                .or_else(|| params.auth.as_ref().map(|_| "require".to_string()));
+                .or_else(|| {
+                    params.auth.as_ref().map(|auth| match auth {
+                        ConnectionAuth::GcpWorkloadIdentity { .. } => "require".to_string(),
+                        ConnectionAuth::AzureWorkloadIdentity { .. } => "verify-full".to_string(),
+                    })
+                });
             if let Some(ssl_mode) = ssl_mode {
                 // Validate sslMode at runtime — CRD validation only catches
                 // literal values; a secret ref could resolve to anything.
@@ -977,6 +992,9 @@ pub enum ContextError {
 
     #[error("GCP auth token response was invalid: {detail}")]
     GcpAuthInvalidResponse { detail: String },
+
+    #[error("Azure Workload Identity authentication failed: {0}")]
+    AzureAuth(#[source] pgroles_inspect::azure_auth::AzureAuthError),
 }
 
 impl ContextError {
@@ -991,12 +1009,23 @@ impl ContextError {
         )
     }
 
-    pub fn is_gcp_auth_non_transient(&self) -> bool {
+    pub fn is_auth_non_transient(&self) -> bool {
         matches!(
             self,
             ContextError::GcpAuthRejected { status, .. }
                 if (400..500).contains(status) && *status != 429
         ) || matches!(self, ContextError::GcpAuthInvalidResponse { .. })
+            || matches!(
+                self,
+                ContextError::AzureAuth(
+                    pgroles_inspect::azure_auth::AzureAuthError::MissingEnvironment(_)
+                        | pgroles_inspect::azure_auth::AzureAuthError::InvalidTenant
+                        | pgroles_inspect::azure_auth::AzureAuthError::InvalidResponse
+                )
+            )
+            || matches!(self, ContextError::AzureAuth(
+              pgroles_inspect::azure_auth::AzureAuthError::Rejected(status)
+          ) if (400..500).contains(status) && *status != 429)
     }
 }
 
@@ -1170,7 +1199,7 @@ mod tests {
             body: "forbidden".into(),
         };
 
-        assert!(error.is_gcp_auth_non_transient());
+        assert!(error.is_auth_non_transient());
     }
 
     #[test]
@@ -1181,7 +1210,7 @@ mod tests {
             body: "rate limited".into(),
         };
 
-        assert!(!error.is_gcp_auth_non_transient());
+        assert!(!error.is_auth_non_transient());
     }
 
     #[test]

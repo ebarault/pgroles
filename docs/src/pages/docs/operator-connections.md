@@ -138,6 +138,58 @@ principal name such as `sa@project.iam` is rejected. Name the PostgreSQL group
 role to switch into, not the identity you authenticate as. See
 [executor privileges](/docs/executor-privileges) for what that role needs.
 
+### AKS Workload Identity for Azure PostgreSQL Flexible Server
+
+Use `connection.params.auth.type: azure_workload_identity` for Microsoft Entra
+authentication. The operator reads the projected AKS service account assertion,
+exchanges it for the PostgreSQL resource scope, and uses the short lived access
+token as the PostgreSQL password. It refreshes the token and connection pool
+before expiry. No PostgreSQL password Secret is required. `password` and
+`passwordSecret` are rejected in this mode; omitted `sslMode` defaults to
+`verify-full` so the server certificate and hostname are checked.
+
+```yaml
+operator:
+  serviceAccount:
+    annotations:
+      azure.workload.identity/client-id: <managed-identity-client-id>
+  podLabels:
+    azure.workload.identity/use: "true"
+```
+
+```yaml
+connection:
+  params:
+    host: myserver.postgres.database.azure.com
+    dbname: postgres
+    username: pgroles-operator
+    auth:
+      type: azure_workload_identity
+```
+
+Configure the AKS federated identity credential, [enable Entra authentication](https://learn.microsoft.com/en-us/azure/postgresql/security/security-entra-configure)
+on the Flexible Server, and [create/map the Entra principal](https://learn.microsoft.com/en-us/azure/postgresql/security/security-connect-with-managed-identity#create-an-azure-database-for-postgresql-user-for-your-managed-identity)
+as a PostgreSQL role before reconciliation. The pod needs `AZURE_CLIENT_ID`,
+`AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`, injected by the AKS
+Workload Identity webhook. Treat the Entra role as externally owned in policy:
+
+```yaml
+roles:
+  - name: pgroles-operator
+    external: true
+```
+
+`external: true` leaves role creation, attributes, password, and deletion to
+Azure, while declared memberships and grants can still refer to that role.
+Use a separate PostgreSQL role and `setRole` if the login identity needs the
+executor privileges described in [executor privileges](/docs/executor-privileges).
+
+The CLI supports the same projected identity with
+`pgroles diff --azure-workload-identity --database-url 'postgres://pgroles-operator@myserver.postgres.database.azure.com/postgres?sslmode=verify-full'`.
+The flag also applies to `apply`, `inspect`, `generate`, and current-state
+`graph`; omit a password from the connection URL. The CLI obtains a fresh
+access token for each invocation.
+
 {% callout type="note" title="Host resolution" %}
 The `host` must be reachable from the operator pod. For an in-cluster database in a different namespace, use the fully qualified service name (e.g. `my-postgres.my-namespace.svc`). For a database outside the cluster, use the external hostname or IP directly (e.g. `db.example.com` or `10.0.1.50`).
 {% /callout %}
