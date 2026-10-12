@@ -602,7 +602,7 @@ impl JsonSchema for ConnectionAuth {
                     "enum": ["gcp_workload_identity", "azure_workload_identity"],
                     "description": "Provider authentication mechanism."
                 },
-                "impersonateServiceAccount": {"type": "string", "nullable": true, "description": "Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity."},
+                "impersonateServiceAccount": {"type": "string", "nullable": true, "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity."},
                 "scope": {"type": "string", "nullable": true, "description": "OAuth scope requested for the access token."}
             }
         })

@@ -30,7 +30,7 @@
                   "nullable": true,
                   "properties": {
                     "impersonateServiceAccount": {
-                      "description": "Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity.",
+                      "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity.",
                       "nullable": true,
                       "type": "string"
                     },
