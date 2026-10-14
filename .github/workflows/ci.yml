@@ -6,8 +6,8 @@ on:
     # so the commit a release tag will point at has a successful push run for
     # release.yml's candidate-ci gate to find.
     branches: [main, "release/**"]
+  # Dependent drafts targeting a stack parent need the same checks as main.
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read

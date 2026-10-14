@@ -233,13 +233,44 @@ Interpretation:
   reality, so an unchanged section produces no SQL.
 - `Ready=False, reason=BlockedByActivePolicy` means the parent is failing or
   has its own plan awaiting a decision; the candidate is planned once the
-  parent settles.
+  parent settles. A parent whose plan an apply guard refused before any SQL
+  ran (`ExecutorAuthority`, `OwnerTransferBlocked`, `UnsafeRoleDrops`) is the
+  exception: candidates are still planned, with
+  `executionPreflight.parentState=ExecutionBlocked`, so a repair can be
+  previewed while the policy it fixes is degraded.
 - Candidate planning filters undeclared object-grant revokes using the proposed roles' `preserve_undeclared_grants` setting, before SQL and approval digest generation. Explicit absence, default privileges, and memberships retain their normal semantics.
-- Candidate planning still omits executor-authority preflight, advisory warnings,
-  and the adopt-mode schema-owner-transfer guard. `Ready=True` does not prove
-  apply will succeed. Check executor authority and parent execution settings
-  separately. Changed effects require a replacement plan at promotion; the
-  approved digest does not bypass execution checks.
+- Candidate planning runs every apply guard — executor authority, the
+  adopt-mode schema-owner-transfer refusal and role-drop safety — on the final
+  filtered changes and actual target, with the parent's execution settings
+  (`mode`, `allow_schema_owner_transfers`). They are the functions apply calls,
+  so a preview and the apply it predicts cannot disagree. Gate each
+  environment's candidate: a staging parent that allows ownership transfers
+  says nothing about a production parent that does not. Same-database
+  overrides keep their own executor pool while sharing only database locks.
+  Status writes use UID and resourceVersion preconditions; conflicting
+  invalidation rechecks current ownership and terminal state. Known blockers
+  leave the review SQL and plan reference available with
+  `Ready=False/ExecutionBlocked` and phase `Planned`.
+  `status.executionPreflight` carries `Blocked` or `NoKnownBlockers`
+  eligibility, guard/code/message diagnostics, and the `evaluatedAt`,
+  `parentGeneration` and `parentState` it was computed against. For SQL
+  previews, CI requires candidate Ready=True and NoKnownBlockers,
+  `parentGeneration` equal to the parent's current generation, an
+  `evaluatedAt` newer than the gate's start, and `parentState=Converged` (or
+  `ExecutionBlocked` when reviewing a repair of that policy). Absence of a
+  current result must fail the gate. NoEffects is the separate no-SQL outcome.
+  Apply reruns every guard against fresh state. Advisory warnings are not
+  guards and do not affect eligibility. Changed effects require a replacement
+  plan at promotion; the approved digest does not bypass execution checks.
+- Preflight covers current parent settings. A CI gate claiming apply eligibility
+  requires `spec.mode=apply`, matching parent generation and a fresh evaluation.
+  Observe executes nothing and permits review of ownership transfers; its
+  passing result does not establish future apply eligibility. Mode changes
+  re-evaluate guards. Flag-only edits retain identical SQL and approval while
+  refreshing eligibility. Covered local retirement hazards are warnings;
+  foreign-database dependencies remain blockers, and preview runs no cleanup.
+  NoEffects clears the preflight result. Offline validate/graph/WASM cannot
+  assess parent settings or live drop dependencies; these checks are uncovered.
 - The spec is immutable. Revise by filing a successor that names this
   candidate in `spec.replaces`.
 - Approving the candidate's plan executes nothing by itself. Execution happens

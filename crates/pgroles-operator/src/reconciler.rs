@@ -122,7 +122,7 @@ pub enum ReconcileError {
     #[error("{0}")]
     UnsafeRoleDrops(String),
 
-    #[error("adopt mode would transfer schema ownership: {0}")]
+    #[error("{0}")]
     OwnerTransferBlocked(String),
 
     #[error("Kubernetes API error: {0}")]
@@ -282,37 +282,58 @@ pub(crate) fn plan_advisory_warnings(
     warnings
 }
 
-/// The adopt-mode schema-ownership-transfer guard.
-///
-/// Returns the blocking message when an adopt plan would transfer ownership
-/// of any schema whose live owner differs, unless explicitly allowed. The
-/// CLI enforces the same rule behind `--allow-schema-owner-transfers`.
-pub(crate) fn adopt_owner_transfer_blocker(
-    mode: pgroles_core::diff::ReconciliationMode,
-    allow_schema_owner_transfers: bool,
+/// The execution settings `policy`'s apply runs with: whether it executes
+/// SQL, and whether adopt-mode schema ownership transfers are allowed. A
+/// candidate is evaluated with its parent's settings, which promotion keeps.
+pub(crate) fn execution_settings(policy: &PostgresPolicy) -> pgroles_inspect::ExecutionSettings {
+    pgroles_inspect::ExecutionSettings {
+        // The operator executes without a human reviewing the plan, so the
+        // CLI's flag-gated transfer refusal applies here too — but only when
+        // SQL will actually run. Observe policies keep producing plans for
+        // review regardless.
+        executes: matches!(policy.spec.mode, crate::crd::PolicyMode::Apply),
+        allow_schema_owner_transfers: policy.spec.allow_schema_owner_transfers,
+        transfer_allowance: "set spec.allow_schema_owner_transfers",
+    }
+}
+
+/// Run the apply guards shared with the CLI under `policy`'s execution
+/// settings. A policy's apply and its candidates' previews both call this.
+pub(crate) async fn evaluate_execution_guards(
+    pool: &sqlx::PgPool,
+    policy: &PostgresPolicy,
+    reconciliation_mode: pgroles_core::diff::ReconciliationMode,
     changes: &[pgroles_core::diff::Change],
-) -> Option<String> {
-    if mode != pgroles_core::diff::ReconciliationMode::Adopt || allow_schema_owner_transfers {
-        return None;
-    }
-    let transfers: Vec<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            pgroles_core::diff::Change::AlterSchemaOwner { name, owner } => {
-                Some(format!("\"{name}\" -> \"{owner}\""))
+    current: &pgroles_core::model::RoleGraph,
+    retirements: &[pgroles_core::manifest::RoleRetirement],
+) -> Result<pgroles_inspect::ExecutionGuardFindings, ReconcileError> {
+    Ok(pgroles_inspect::evaluate_execution_guards(
+        pool,
+        &execution_settings(policy),
+        reconciliation_mode,
+        changes,
+        current,
+        retirements,
+    )
+    .await?)
+}
+
+/// A blocker as candidate status reports it.
+pub(crate) fn status_blocker(
+    blocker: pgroles_inspect::ExecutionBlocker,
+) -> crate::crd::ExecutionBlocker {
+    use crate::crd::ExecutionGuard;
+    crate::crd::ExecutionBlocker {
+        guard: match blocker.guard {
+            pgroles_inspect::ExecutionGuard::ExecutorAuthority => ExecutionGuard::ExecutorAuthority,
+            pgroles_inspect::ExecutionGuard::SchemaOwnerTransfer => {
+                ExecutionGuard::SchemaOwnerTransfer
             }
-            _ => None,
-        })
-        .collect();
-    if transfers.is_empty() {
-        return None;
+            pgroles_inspect::ExecutionGuard::RoleDropSafety => ExecutionGuard::RoleDropSafety,
+        },
+        code: blocker.code,
+        message: blocker.message,
     }
-    Some(format!(
-        "{} schema(s): {}. Set spec.allow_schema_owner_transfers to permit this, \
-         use additive mode to skip transfers, or declare each schema's current owner.",
-        transfers.len(),
-        transfers.join(", ")
-    ))
 }
 
 async fn bounded_k8s_call<T, F>(call: &'static str, future: F) -> Result<T, ReconcileError>
@@ -878,7 +899,14 @@ async fn reconcile_apply(
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
 
-    match reconcile_apply_inner(resource, ctx, &identity).await {
+    let result = reconcile_apply_inner(resource, ctx, &identity).await;
+    // Connection/spec failures and early suspended/conflict exits never reach
+    // candidate planning under the database locks. Invalidate an earlier
+    // successful preview through status alone.
+    if candidate_evaluation_unavailable(&result) {
+        invalidate_candidate_results_best_effort(ctx, resource).await;
+    }
+    match result {
         Ok((action, outcome)) => {
             if !matches!(outcome, ReconcileOutcome::LockContention) {
                 acknowledge_requested_reconcile(
@@ -945,6 +973,68 @@ async fn reconcile_apply(
             }
             Err(err)
         }
+    }
+}
+
+/// How the parent's reconcile ended, for candidate planning, if it reached the
+/// locked phase in a state candidates can be gated on at all.
+fn candidate_parent_outcome(
+    result: &Result<(Action, ReconcileOutcome), ReconcileError>,
+) -> Option<crate::candidate::ParentOutcome> {
+    use crate::candidate::ParentOutcome;
+    match result {
+        Ok((_, ReconcileOutcome::Reconciled | ReconcileOutcome::Planned)) => {
+            Some(ParentOutcome::Converged)
+        }
+        Ok(_) => Some(ParentOutcome::Unstable),
+        Err(err) if is_execution_guard_refusal(err) => Some(ParentOutcome::ExecutionBlocked),
+        Err(_) => None,
+    }
+}
+
+/// Whether an apply guard refused the parent's plan.
+///
+/// Each of these is raised only after the locked phase ran inspection, diff
+/// and [`evaluate_execution_guards`], and before any SQL: none of the plan
+/// executed, the database is as inspected, and both locks are still held. That
+/// is the state a repair is previewed against, so candidates are planned.
+fn is_execution_guard_refusal(err: &ReconcileError) -> bool {
+    matches!(
+        err,
+        ReconcileError::ExecutorAuthority(_)
+            | ReconcileError::OwnerTransferBlocked(_)
+            | ReconcileError::UnsafeRoleDrops(_)
+    )
+}
+
+/// Whether the reconcile ended without a current candidate evaluation, so an
+/// earlier one must be withdrawn.
+///
+/// Lock contention is deliberately excluded. It is routine when several
+/// policies share a database, and the policy holding the lock can change the
+/// database at any time whether or not this one is contended, so clearing on
+/// contention bought no freshness — it only made healthy previews flap.
+/// Every result carries `evaluatedAt` and `parentGeneration` instead, and a
+/// consumer that needs a newer answer compares them.
+fn candidate_evaluation_unavailable(
+    result: &Result<(Action, ReconcileOutcome), ReconcileError>,
+) -> bool {
+    match result {
+        Ok((
+            _,
+            ReconcileOutcome::Reconciled
+            | ReconcileOutcome::Planned
+            | ReconcileOutcome::LockContention,
+        )) => false,
+        Ok(_) => true,
+        Err(ReconcileError::LockContention(_, _)) => false,
+        Err(err) => !is_execution_guard_refusal(err),
+    }
+}
+
+async fn invalidate_candidate_results_best_effort(ctx: &OperatorContext, policy: &PostgresPolicy) {
+    if let Err(err) = crate::candidate::invalidate_parent_evaluation(ctx, policy).await {
+        tracing::warn!(policy = %policy.name_any(), %err, "could not invalidate candidate eligibility; current parent readiness must also be required by preview consumers");
     }
 }
 
@@ -1243,13 +1333,10 @@ async fn reconcile_apply_inner(
     // post-enforcement state rather than the drift the policy just removed.
     // A candidate is a proposal, so nothing it does may break enforcement —
     // failures are recorded on the candidate and swallowed here.
-    if let Ok((_, outcome)) = &result
+    let parent_outcome = candidate_parent_outcome(&result);
+    if let Some(parent_outcome) = parent_outcome
         && let Some(target_identity) = handoff.target_identity.as_ref()
     {
-        let converged = matches!(
-            outcome,
-            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
-        );
         // An API failure here is not "no plan": treating it as one would open
         // the gate while the parent may in fact hold an actionable plan, and
         // the candidate would be planned against a state the database is not
@@ -1261,8 +1348,11 @@ async fn reconcile_apply_inner(
                     identity,
                     target_identity,
                     overlay_edges: &handoff.overlay_edges,
-                    gate: crate::candidate::parent_gate(converged, actionable.is_some()),
+                    gate: crate::candidate::parent_gate(parent_outcome, actionable.is_some()),
                 };
+                // Candidates written earlier in the pass hold current results,
+                // and the rest keep stamped ones a consumer can judge by age,
+                // so a failure partway through withdraws nothing.
                 if let Err(err) =
                     crate::candidate::reconcile_candidates(ctx, resource, &planning).await
                 {
@@ -1270,6 +1360,7 @@ async fn reconcile_apply_inner(
                 }
             }
             Err(err) => {
+                invalidate_candidate_results_best_effort(ctx, resource).await;
                 tracing::warn!(
                     name,
                     namespace,
@@ -1278,6 +1369,10 @@ async fn reconcile_apply_inner(
                 );
             }
         }
+    } else if parent_outcome.is_some() {
+        // No target handoff means there was no evaluation context in which
+        // an earlier candidate result could have been revalidated.
+        invalidate_candidate_results_best_effort(ctx, resource).await;
     }
 
     // Release advisory lock (always, even on error).
@@ -1514,20 +1609,6 @@ async fn apply_under_lock(
         tracing::warn!(name, namespace, warnings = ?plan_warnings, "plan advisory warnings");
     }
 
-    // Adopt-mode ownership transfer refusal: the operator executes without a
-    // human reviewing the plan, so the CLI's flag-gated refusal applies here
-    // too — but only when SQL will actually run. Observe policies keep
-    // producing plans for review regardless.
-    if matches!(resource.spec.mode, crate::crd::PolicyMode::Apply)
-        && let Some(blocker) = adopt_owner_transfer_blocker(
-            reconciliation_mode,
-            resource.spec.allow_schema_owner_transfers,
-            &changes,
-        )
-    {
-        return Err(ReconcileError::OwnerTransferBlocked(blocker));
-    }
-
     ctx.observability
         .record_processing_phase("diff", diff_started.elapsed());
 
@@ -1537,16 +1618,33 @@ async fn apply_under_lock(
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
-    let dropped_roles: Vec<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            pgroles_core::diff::Change::DropRole { name } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    let drop_safety = pgroles_inspect::inspect_drop_role_safety(pool, &dropped_roles)
-        .await?
-        .assess(&manifest.retirements);
+    // The apply guards, shared with candidate previews so that a preview
+    // reports exactly what this apply would refuse.
+    //
+    // Adopt-mode ownership transfers are refused because the operator executes
+    // without a human reviewing the plan, so the CLI's flag-gated refusal
+    // applies here too — but only when SQL will actually run. Observe policies
+    // keep producing plans for review regardless.
+    //
+    // Planned default-privilege changes and PUBLIC revokes need owner
+    // authority the executor may lack; a PUBLIC revoke without it silently
+    // no-ops and the controller would flap. Only executing is blocked there.
+    // Producing and reviewing a plan needs no authority, and failing here
+    // instead would leave an operator with a Degraded policy and nothing to
+    // look at.
+    let guards = evaluate_execution_guards(
+        pool,
+        resource,
+        reconciliation_mode,
+        &changes,
+        &current,
+        &manifest.retirements,
+    )
+    .await?;
+    if let Some(refusal) = guards.owner_transfer_refusal() {
+        return Err(ReconcileError::OwnerTransferBlocked(refusal));
+    }
+    let drop_safety = guards.drop_safety;
     if !drop_safety.warnings.is_empty() {
         tracing::info!(warnings = %drop_safety.warnings, "role-drop cleanup warnings");
     }
@@ -1555,16 +1653,7 @@ async fn apply_under_lock(
             drop_safety.blockers.to_string(),
         ));
     }
-
-    // Planned default-privilege changes and PUBLIC revokes need owner
-    // authority the executor may lack; a PUBLIC revoke without it silently
-    // no-ops and the controller would flap.
-    //
-    // Only executing is blocked. Producing and reviewing a plan needs no
-    // authority, and failing here instead would leave an operator with a
-    // Degraded policy and nothing to look at.
-    let authority_issues =
-        pgroles_inspect::preflight_authority_issues(pool, &changes, &current).await?;
+    let authority_issues = guards.authority;
     let authority_block: Option<String> = if authority_issues.is_empty() {
         None
     } else {
@@ -3779,47 +3868,32 @@ mod tests {
     }
 
     #[test]
-    fn adopt_owner_transfer_blocker_gates_on_flag_and_mode() {
-        let changes = vec![pgroles_core::diff::Change::AlterSchemaOwner {
-            name: "etl".to_string(),
-            owner: "pgloader_pg".to_string(),
-        }];
+    fn a_policy_executes_with_its_own_mode_and_transfer_allowance() {
+        let mut policy = (*test_policy("5m", 0)).clone();
+        let settings = execution_settings(&policy);
+        assert!(settings.executes);
+        assert!(!settings.allow_schema_owner_transfers);
+        assert!(
+            settings
+                .transfer_allowance
+                .contains("spec.allow_schema_owner_transfers")
+        );
+        policy.spec.allow_schema_owner_transfers = true;
+        assert!(execution_settings(&policy).allow_schema_owner_transfers);
+        policy.spec.mode = PolicyMode::Observe;
+        assert!(!execution_settings(&policy).executes);
+    }
 
-        // Adopt without the flag blocks, naming schemas and the spec field.
-        let blocker = adopt_owner_transfer_blocker(
-            pgroles_core::diff::ReconciliationMode::Adopt,
-            false,
-            &changes,
-        )
-        .expect("should block");
-        assert!(blocker.contains("etl"));
-        assert!(blocker.contains("allow_schema_owner_transfers"));
-
-        // The flag permits it; other modes never block.
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Adopt,
-                true,
-                &changes,
-            )
-            .is_none()
-        );
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Authoritative,
-                false,
-                &changes,
-            )
-            .is_none()
-        );
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Adopt,
-                false,
-                &[],
-            )
-            .is_none()
-        );
+    #[test]
+    fn status_blockers_keep_the_guard_code_and_message() {
+        let blocker = status_blocker(pgroles_inspect::ExecutionBlocker {
+            guard: pgroles_inspect::ExecutionGuard::RoleDropSafety,
+            code: "UnsafeRoleDrop".into(),
+            message: "role owns objects".into(),
+        });
+        assert_eq!(blocker.guard, crate::crd::ExecutionGuard::RoleDropSafety);
+        assert_eq!(blocker.code, "UnsafeRoleDrop");
+        assert_eq!(blocker.message, "role owns objects");
     }
 
     #[test]
@@ -6242,5 +6316,220 @@ mod tests {
             );
             assert_eq!(serde_json::to_value(&status).unwrap(), stable);
         }
+    }
+    #[test]
+    fn parent_failure_and_early_exit_paths_invalidate_candidate_eligibility() {
+        for outcome in [
+            ReconcileOutcome::Suspended,
+            ReconcileOutcome::Conflict,
+            ReconcileOutcome::TargetIdentityBlocked,
+        ] {
+            assert!(candidate_evaluation_unavailable(&Ok((
+                Action::await_change(),
+                outcome
+            ))));
+        }
+        for error in [
+            ReconcileError::SqlExec(sqlx::Error::PoolTimedOut),
+            ReconcileError::InvalidSpec("bad".into()),
+        ] {
+            assert!(candidate_evaluation_unavailable(&Err(error)));
+        }
+        for outcome in [ReconcileOutcome::Reconciled, ReconcileOutcome::Planned] {
+            assert!(!candidate_evaluation_unavailable(&Ok((
+                Action::await_change(),
+                outcome
+            ))));
+        }
+    }
+
+    #[test]
+    fn a_parent_refused_by_an_apply_guard_keeps_the_previews_it_just_evaluated() {
+        use crate::candidate::ParentOutcome;
+        for refusal in [
+            ReconcileError::ExecutorAuthority("blocked".into()),
+            ReconcileError::OwnerTransferBlocked("\"warehouse\" -> \"owner\"".into()),
+            ReconcileError::UnsafeRoleDrops("role owns objects".into()),
+        ] {
+            let blocked = Err(refusal);
+            assert_eq!(
+                candidate_parent_outcome(&blocked),
+                Some(ParentOutcome::ExecutionBlocked)
+            );
+            // The inner reconcile planned candidates against the unchanged
+            // database; the outer path must not withdraw those results.
+            assert!(!candidate_evaluation_unavailable(&blocked));
+        }
+        assert_eq!(
+            candidate_parent_outcome(&Ok((Action::await_change(), ReconcileOutcome::Suspended))),
+            Some(ParentOutcome::Unstable)
+        );
+        assert_eq!(
+            candidate_parent_outcome(&Err(ReconcileError::InvalidSpec("bad".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn lock_contention_does_not_withdraw_a_stamped_preview() {
+        assert!(!candidate_evaluation_unavailable(&Ok((
+            Action::await_change(),
+            ReconcileOutcome::LockContention
+        ))));
+        assert!(!candidate_evaluation_unavailable(&Err(
+            ReconcileError::LockContention("db".into(), "busy".into())
+        )));
+    }
+    /// Uses only the disposable DATABASE_URL fixture, with unique names. The
+    /// same retained DROP is checked on two targets without executing cleanup.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL instance with CREATEDB/CREATEROLE"]
+    async fn live_drop_guards_use_target_and_retirements_without_mutating() {
+        use futures::FutureExt;
+        use pgroles_core::{
+            diff::{Change, ReconciliationMode},
+            manifest::RoleRetirement,
+        };
+        use sqlx::{
+            Connection, Executor,
+            postgres::{PgConnectOptions, PgPoolOptions},
+        };
+        use std::{panic::AssertUnwindSafe, str::FromStr};
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for disposable test fixture");
+        let options = PgConnectOptions::from_str(&url).unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let policy = test_policy("5m", 0);
+        let suffix = rand::random::<u64>();
+        let role = format!("guard_retired_{suffix}");
+        let space = format!("guard_space_{suffix}");
+        let other_database = format!("guard_target_{suffix}");
+        // Keep cleanup outside the assertion future so panic unwinding also
+        // releases sessions and removes only this fixture's unique objects.
+        let result = AssertUnwindSafe(async {
+            pool.execute(format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'").as_str())
+                .await
+                .unwrap();
+            pool.execute(format!("CREATE SCHEMA {space} AUTHORIZATION {role}").as_str())
+                .await
+                .unwrap();
+            pool.execute(format!("CREATE DATABASE {other_database}").as_str())
+                .await
+                .unwrap();
+            let other_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(options.clone().database(&other_database))
+                .await
+                .unwrap();
+            let mut session = sqlx::PgConnection::connect_with(
+                &options.username(&role).password("fixture-password"),
+            )
+            .await
+            .unwrap();
+            session
+                .execute(format!("CREATE TABLE {space}.records (id int)").as_str())
+                .await
+                .unwrap();
+            let changes = vec![Change::DropRole { name: role.clone() }];
+            let retirements = vec![RoleRetirement {
+                role: role.clone(),
+                reassign_owned_to: Some("postgres".into()),
+                drop_owned: true,
+                terminate_sessions: true,
+            }];
+            let uncovered = evaluate_execution_guards(
+                &pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(uncovered.has_blockers());
+            let local = evaluate_execution_guards(
+                &pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &retirements,
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(!local.has_blockers(), "{}", local.blockers);
+            assert!(!local.warnings.is_empty());
+            let external = evaluate_execution_guards(
+                &other_pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &retirements,
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(
+                external.has_blockers(),
+                "another database's dependencies remain blocked"
+            );
+            assert!(
+                external
+                    .blockers
+                    .issues
+                    .iter()
+                    .any(|issue| issue.external_owned_object_count > 0)
+            );
+            assert!(external.blockers.issues.iter().any(|issue| {
+                issue
+                    .external_owned_object_examples
+                    .iter()
+                    .any(|example| example.contains("catalog "))
+            }));
+            // Cleanup coverage is advice: preview must neither terminate this
+            // session nor reassign/drop the objects or the role.
+            let owner: String = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = $1::regclass",
+            )
+            .bind(format!("{space}.records"))
+            .fetch_one(&mut session)
+            .await
+            .unwrap();
+            assert_eq!(owner, role);
+            let who: String = sqlx::query_scalar("SELECT current_user::text")
+                .fetch_one(&mut session)
+                .await
+                .unwrap();
+            assert_eq!(who, role);
+            session.close().await.unwrap();
+            other_pool.close().await;
+        })
+        .catch_unwind()
+        .await;
+        let mut cleanup_errors = Vec::new();
+        for statement in [
+            format!("DROP DATABASE IF EXISTS {other_database} WITH (FORCE)"),
+            format!("DROP SCHEMA IF EXISTS {space} CASCADE"),
+            format!("DROP ROLE IF EXISTS {role}"),
+        ] {
+            if let Err(error) = pool.execute(statement.as_str()).await {
+                cleanup_errors.push(error.to_string());
+            }
+        }
+        pool.close().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            cleanup_errors.is_empty(),
+            "fixture cleanup: {cleanup_errors:?}"
+        );
     }
 }

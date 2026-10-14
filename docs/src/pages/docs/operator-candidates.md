@@ -54,11 +54,102 @@ and memberships retain their normal reconciliation semantics. If only preserved
 grants differ, the candidate reports `Ready=True` with reason `NoEffects` and
 creates no approval plan.
 
-Candidate planning still omits executor-authority preflight, plan advisory
-warnings, and the adopt-mode schema-owner-transfer guard. `Ready=True` means a
-preview is available; it does not prove the executor can apply it. Execution
-settings such as `allow_schema_owner_transfers` remain on the parent, outside
-candidate content.
+Candidate planning runs the guards apply runs before it executes anything,
+against its target and final filtered changes, with the parent policy's
+execution settings — the settings promotion keeps:
+
+| Guard | Refuses |
+| --- | --- |
+| `ExecutorAuthority` | A statement the executor lacks the privileges to run, such as a revoke that needs a grantor the executor cannot act as |
+| `SchemaOwnerTransfer` | An adopt-mode schema ownership transfer, when the parent is `mode: apply` and does not set `allow_schema_owner_transfers` |
+| `RoleDropSafety` | A role drop whose owned objects, privileges or sessions its retirement does not handle |
+
+These are the same functions apply calls, so a preview cannot pass a plan the
+apply it predicts would refuse. Because the parent's settings apply, the same
+content can be eligible against one environment and blocked against another:
+a staging policy that allows ownership transfers says nothing about a
+production policy that does not.
+
+Known blockers report `Ready=False, reason=ExecutionBlocked`, while phase
+`Planned`, `planRef` and the review SQL remain available. No privileges are
+changed by these checks. `Ready=True, reason=Planned` means no guard found a
+known blocker; it is not a guarantee that SQL will execute. Apply reruns every
+guard against fresh state.
+The structured `status.executionPreflight` object reports `eligibility` as
+`Blocked` or `NoKnownBlockers`, plus an `issues` array in which each entry
+names its `guard`, a stable `code`, and a readable `message`. It also records
+what the answer was computed against: `evaluatedAt` (RFC 3339),
+`parentGeneration` (the parent policy's `metadata.generation`), and
+`parentState`, which is `Converged` or `ExecutionBlocked`. It is absent when no
+current check is available, including a parent block or planning failure.
+`Ready=True/NoEffects` separately reports that there is no SQL to execute.
+Phase `Planned` records review SQL availability even when a guard blocks
+execution.
+
+A CI gate for a preview with SQL should pass only when all of these hold:
+
+- the parent has `spec.mode=apply` when the gate claims apply eligibility;
+- candidate `Ready=True` with reason `Planned`, and
+  `executionPreflight.eligibility=NoKnownBlockers`;
+- `executionPreflight.parentGeneration` equals the parent's current
+  `metadata.generation`;
+- `executionPreflight.evaluatedAt` is not older than the gate's own start, or
+  than any event the result must follow, such as a migration or restore;
+- `executionPreflight.parentState` is `Converged`, or `ExecutionBlocked` when
+  the change under review is a repair of that blocked policy.
+
+Gate on the candidate for each environment the change will reach. A preview is
+computed against its parent's target and settings, so a passing staging
+candidate is not evidence about production.
+
+A missing or `Blocked` result fails the gate.
+
+Explicit target overrides retain their own connection and execution identity,
+even when the parent already holds the locks for the same database.
+
+Parent failures other than an apply-guard refusal, suspension and unavailable
+planning clear previous eligibility and mark nonterminal previews unready
+through status only; their review SQL and plan reference remain available. Lock
+contention does not, on the parent or on a target override: it is routine when
+policies share a database, and the stamped `evaluatedAt` and `parentGeneration`
+already let a consumer reject a result that is too old. A failure confined to
+one candidate — its adoption, or reading its plans — reports `Ready=False` with
+reason `PlanningFailed` on that candidate alone rather than blaming the parent,
+and a failure partway through a pass withdraws nothing already written. If the
+API cannot accept a status update, consumers must also reject the unhealthy
+parent. Promotion clears preview eligibility because it no longer describes
+current candidate review SQL. Every candidate status write tests the
+candidate's UID and resourceVersion; a conflict re-reads the candidate and
+retries against the fresh object, and abandons the write if that object is a
+different incarnation or became terminal, so an older snapshot cannot reopen a
+superseded or promoted proposal.
+
+The result describes the parent's **current** execution settings. Observe
+continues to execute nothing and does not refuse schema transfers; a passing
+observe preview does not establish eligibility for a future switch to apply.
+Changing mode advances the parent generation and re-evaluates the guards. If
+that switch exposes a disallowed adopt transfer, the fresh preview is blocked.
+A gate claiming apply eligibility must require apply mode, current generation
+and a fresh evaluation, rather than reuse the earlier observe result.
+
+Execution settings such as `allow_schema_owner_transfers` remain on the parent,
+outside candidate content and its digest. Flag-only changes refresh eligibility
+without replacing identical review SQL or its approval. Approvals never bypass
+fresh guards before promotion recognition.
+
+Role-drop safety inspects only retained drops on the actual target, using the
+candidate's own retirements. Covered local hazards are advisory warnings;
+foreign-database dependencies remain blockers. Preview neither terminates
+sessions nor reassigns or drops objects. `NoEffects`, unavailable evaluation,
+supersession and promotion clear old preflight results.
+
+Other plan advisory warnings remain outside preview coverage. Offline
+`validate`, graph analysis and the WASM explorer do not have the parent's
+settings or live role-drop dependencies: these operator checks are uncovered
+there, not passing. `pgroles diff` runs the same guards against a live
+database with the settings its flags give, and records them in a
+[recorded review](/docs/recorded-reviews); it cannot know a policy's settings
+unless you pass the matching flags.
 
 Promotion recomputes effects and checks the approved digest before execution.
 Different effects require a replacement plan; matching effects can still be
@@ -185,6 +276,17 @@ interval would have run — but no effect of the candidate itself executes.
 If the active policy is failing or awaiting its own approval, the candidate
 reports `Ready=False` with reason `BlockedByActivePolicy` and is re-planned
 when the parent recovers.
+
+One kind of failure is the exception: a parent whose own plan an apply guard
+refused — `ExecutorAuthority`, `OwnerTransferBlocked` or `UnsafeRoleDrops` on
+the policy. Every guard runs before the plan's single transaction, so none of
+it ran, the database is not about to change under the candidate, and a
+candidate is usually how the policy gets repaired. Candidates are still planned
+against the unchanged database, report
+`executionPreflight.parentState=ExecutionBlocked`, and say in their `Ready`
+message that promoting them replaces the blocked content. A repair whose own
+preview has no known blockers can therefore be reviewed and gated normally
+while the policy it fixes is degraded.
 
 ```text
 NAME                  POLICY   PHASE     CHANGES   PLAN                              AGE
@@ -527,9 +629,10 @@ database and still inspects for itself.
 
 | Condition | Meaning |
 | --- | --- |
-| `Ready=True, reason=Planned` | A current plan exists for this candidate |
+| `Ready=True, reason=Planned` | A current plan exists and no apply guard found a known blocker |
+| `Ready=False, reason=ExecutionBlocked` | Review SQL exists, but an apply guard would refuse to execute it; `status.executionPreflight.issues` and the message list each blocker and its guard |
 | `Ready=True, reason=NoEffects` | The content is already the database's state, so there is nothing to review. Not terminal — the content may diverge again |
-| `Ready=False, reason=BlockedByActivePolicy` | Parent is failing or awaiting its own approval; will re-plan |
+| `Ready=False, reason=BlockedByActivePolicy` | Parent is failing (other than by an apply-guard refusal) or awaiting its own approval; will re-plan |
 | `Ready=False, reason=OverlayOverlap` | An ephemeral grant overlaps this candidate's effects; fresh review required |
 | `Ready=False, reason=PlanningFailed` | The candidate could not be planned at all; the message carries the error |
 | `Ready=False, reason=CandidateBudgetExceeded` | The policy is at its open-candidate budget and older proposals are ahead in the queue. Not terminal, and nothing is deleted — it plans once they are decided or expire |
