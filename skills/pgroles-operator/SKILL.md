@@ -127,10 +127,12 @@ pgroles reconcile postgrespolicy/<name> -n <namespace> --wait --timeout 2m
 kubectl -n <namespace> get postgrespolicy <name> -o yaml
 ```
 
-`--wait` acknowledges that the request reached a successful planning or
-reconciliation outcome through `status.lastHandledReconcileAt`. It does not
-guarantee SQL was applied. Requests blocked by suspension, conflict, contention,
-or failure may remain unacknowledged.
+`--wait` succeeds when `status.lastHandledReconcileAt` shows the request
+reached a successful planning or reconciliation outcome; it does not guarantee
+SQL was applied. It fails with the `Ready` reason as soon as
+`status.lastAttemptedReconcileAt` shows the request ran and was suspended,
+conflicted, refused or failed. Lock contention leaves both unset: that
+reconcile has not run yet.
 
 ## Plans And Approval
 
@@ -175,6 +177,13 @@ Reject by writing `Denied` with reason `DeniedByReviewer` in place of
 second `Approved` entry alongside the `Approved=False` a plan is created with,
 or the CRD's terminality rule wedges the plan. A decision is terminal and
 write-once; iterating means a new plan, not an edited decision.
+
+Under `approval: auto`, a plan stays `Pending` while the executor lacks the
+authority it needs (`Ready=False`, reason `ExecutorAuthority`); nothing runs, and
+later reconciles reuse that plan rather than opening new ones. Fix the authority
+gap or change the policy — do not grant broad provider administration to get
+past the check. Denying the waiting plan voids only that plan; set
+`approval: manual` or `suspend` to stop automatic execution.
 
 After approval, wait for `Applied` and then verify the parent policy's convergence
 conditions. A plan object supports review and recent history, but is not

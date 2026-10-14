@@ -180,6 +180,9 @@ pub enum ReconcileError {
     #[error("{0}")]
     ExecutorAuthority(String),
 
+    #[error("plan {0} carries a Denied decision and will not be approved or executed")]
+    PlanDenied(String),
+
     #[error("{0}")]
     ConflictingPolicy(String),
 
@@ -615,6 +618,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         // Waiting out the plan's retry window is exactly the normal interval:
         // requeuing sooner would re-enter the back-off and re-defer.
         ReconcileError::PlanRetryDeferred(_, _)
+        | ReconcileError::PlanDenied(_)
         | ReconcileError::NonConvergentPlan(_)
         | ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
@@ -876,9 +880,14 @@ async fn reconcile_apply(
 
     match reconcile_apply_inner(resource, ctx, &identity).await {
         Ok((action, outcome)) => {
-            if outcome.marks_requested_reconcile_handled() {
-                mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
-                    .await?;
+            if !matches!(outcome, ReconcileOutcome::LockContention) {
+                acknowledge_requested_reconcile(
+                    ctx,
+                    resource,
+                    requested_reconcile_at.as_deref(),
+                    outcome.marks_requested_reconcile_handled(),
+                )
+                .await?;
             }
             reconcile_guard.record_result(outcome.result(), outcome.reason());
             Ok(action)
@@ -916,6 +925,8 @@ async fn reconcile_apply(
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
+            // The attempt is acknowledged in the same write as the failure,
+            // so a reader that sees the acknowledgement sees this outcome.
             if let Err(status_err) = update_status(ctx, resource, |status| {
                 mark_reconcile_failure_status(
                     status,
@@ -924,6 +935,9 @@ async fn reconcile_apply(
                     is_transient_failure,
                     clear_current_plan_ref,
                 );
+                if let Some(requested) = requested_reconcile_at.as_deref() {
+                    status.last_attempted_reconcile_at = Some(requested.to_string());
+                }
             })
             .await
             {
@@ -941,19 +955,37 @@ fn requested_reconcile_at(resource: &PostgresPolicy) -> Option<String> {
         .cloned()
 }
 
-async fn mark_requested_reconcile_handled(
+/// Record that the reconcile requested at `requested_reconcile_at` ran.
+///
+/// `lastAttemptedReconcileAt` is written for every outcome that evaluated the
+/// policy, so a script can tell "ran and was refused" from "has not run yet".
+/// `lastHandledReconcileAt` keeps its narrower meaning: the request reconciled
+/// or produced a plan.
+async fn acknowledge_requested_reconcile(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
     requested_reconcile_at: Option<&str>,
+    handled: bool,
 ) -> Result<(), ReconcileError> {
     let Some(requested_reconcile_at) = requested_reconcile_at else {
         return Ok(());
     };
 
     update_status(ctx, resource, |status| {
-        status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+        status.last_attempted_reconcile_at = Some(requested_reconcile_at.to_string());
+        if handled {
+            status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+        }
     })
     .await
+}
+
+fn set_blocked_plan_ref(status: &mut PostgresPolicyStatus, plan_name: &str) {
+    // The summary stays on the review plan. Failure status clears the policy
+    // summary, so setting it here would add a needless Some -> None round trip.
+    status.current_plan_ref = Some(crate::crd::PlanReference {
+        name: plan_name.to_string(),
+    });
 }
 
 fn mark_reconcile_failure_status(
@@ -1632,6 +1664,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                crate::plan::PlanReuse::PendingOnly,
                 false,
             )
             .await?;
@@ -1754,6 +1787,7 @@ async fn apply_under_lock(
                     &applied_password_source_versions,
                     ctx.plan_retention,
                     None,
+                    crate::plan::PlanReuse::AutoApproval,
                     true,
                 )
                 .await?;
@@ -1810,6 +1844,17 @@ async fn apply_under_lock(
                     .await;
                 }
 
+                // Publish the review reference while the blocked plan stays
+                // Pending. Approval is an execution decision, so missing
+                // authority must stop before recording AutoApproved.
+                if let Some(message) = &authority_block {
+                    update_status(ctx, resource, |status| {
+                        set_blocked_plan_ref(status, &plan_name);
+                    })
+                    .await?;
+                    return Err(ReconcileError::ExecutorAuthority(message.clone()));
+                }
+
                 crate::plan::mark_plan_approved(
                     &ctx.kube_client,
                     &plan,
@@ -1821,13 +1866,6 @@ async fn apply_under_lock(
                 // Re-fetch after approval status update.
                 let plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::Approved).await;
-
-                // The plan exists and is reviewable; this is the point past
-                // which it would execute, so this is where missing authority
-                // stops it.
-                if let Some(message) = &authority_block {
-                    return Err(ReconcileError::ExecutorAuthority(message.clone()));
-                }
 
                 emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
 
@@ -1896,6 +1934,15 @@ async fn apply_under_lock(
                 info!(name, namespace, "no changes needed");
             }
 
+            // A plan published while executor authority was missing stays
+            // referenced and Pending. With no changes left its effects are
+            // gone, so it is retired with no replacement, as in observe mode.
+            let stale_pending_ref = if changes.is_empty() {
+                referenced_pending_plan(ctx, resource).await
+            } else {
+                None
+            };
+
             // The database now holds this content, however it got there — an
             // auto-approved apply, or nothing to do because it was already
             // converged. Either way a candidate proposing exactly this content
@@ -1923,8 +1970,16 @@ async fn apply_under_lock(
                 status.last_error = None;
                 status.applied_password_source_versions = applied_password_source_versions;
                 status.transient_failure_count = 0;
+                if stale_pending_ref.is_some() {
+                    status.current_plan_ref = None;
+                }
             })
             .await?;
+
+            // After the status write, as in observe mode: a crash in between
+            // leaves a Pending plan the next pass retires, never a reference
+            // to a retired plan.
+            supersede_referenced_plan_if_pending(ctx, resource, stale_pending_ref.as_ref()).await;
 
             Ok((
                 Action::requeue(requeue_interval),
@@ -2124,6 +2179,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                crate::plan::PlanReuse::PendingOnly,
                                 false,
                             )
                             .await?;
@@ -2467,6 +2523,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                crate::plan::PlanReuse::PendingOnly,
                                 false,
                             )
                             .await?;
@@ -2615,6 +2672,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                crate::plan::PlanReuse::PendingOnly,
                 false,
             )
             .await?;
@@ -3295,6 +3353,28 @@ async fn mark_reconciled_no_changes(
 /// Best-effort by design: the reference is already gone, so a failure here
 /// costs a stale Pending plan that the next reconcile or plan retention
 /// collects — not a wedged reconcile.
+/// The policy's referenced plan, when it is still Pending.
+async fn referenced_pending_plan(
+    ctx: &OperatorContext,
+    resource: &PostgresPolicy,
+) -> Option<crate::crd::PlanReference> {
+    let plan_ref = resource.status.as_ref()?.current_plan_ref.clone()?;
+    let namespace = resource.namespace()?;
+    let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    match plans_api.get_opt(&plan_ref.name).await {
+        Ok(Some(plan))
+            if plan.status.as_ref().map(|s| &s.phase) == Some(&crate::crd::PlanPhase::Pending) =>
+        {
+            Some(plan_ref)
+        }
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(plan = %plan_ref.name, error = %err, "could not read the referenced plan");
+            None
+        }
+    }
+}
+
 async fn supersede_referenced_plan_if_pending(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
@@ -3395,13 +3475,9 @@ where
     apply_additive_absence_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
-    // A status write that changes nothing still bumps `resourceVersion`, and
-    // the resulting watch event re-triggers this controller immediately —
-    // discarding whatever back-off `error_policy` chose. That is not a
-    // theoretical cost: a permanently-failing policy reconciles, writes status,
-    // wakes itself, and spins as fast as it can reconcile (~5/second observed),
-    // taking the per-database advisory lock every time and starving every other
-    // policy pointed at the same database.
+    // Avoid redundant API writes and resourceVersion changes. The policy
+    // watch filters status-only updates; this does not imply a self-triggered
+    // reconcile loop, but no-op status patches still cost API requests.
     //
     // Compared as serialized JSON rather than with `PartialEq`: the question is
     // whether the PATCH body differs from what is stored, and that is exactly a
@@ -3615,6 +3691,7 @@ impl ReconcileError {
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::ExecutorAuthority(_) => "ExecutorAuthority",
+            ReconcileError::PlanDenied(_) => "PlanDenied",
             ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
@@ -6136,5 +6213,34 @@ mod tests {
         // Should be within 2 seconds of now.
         let diff = now_secs.abs_diff(parsed.unwrap());
         assert!(diff <= 2, "parsed time should be close to now, diff={diff}");
+    }
+    #[test]
+    fn blocked_authority_retry_does_not_temporarily_change_failure_status() {
+        let mut status = PostgresPolicyStatus::default();
+        set_blocked_plan_ref(&mut status, "blocked-plan");
+        mark_reconcile_failure_status(
+            &mut status,
+            "ExecutorAuthority",
+            "grantor unavailable",
+            false,
+            false,
+        );
+        let stable = serde_json::to_value(&status).unwrap();
+        for _ in 0..3 {
+            set_blocked_plan_ref(&mut status, "blocked-plan");
+            assert_eq!(
+                serde_json::to_value(&status).unwrap(),
+                stable,
+                "publishing the same review reference must not create an intermediate status patch"
+            );
+            mark_reconcile_failure_status(
+                &mut status,
+                "ExecutorAuthority",
+                "grantor unavailable",
+                false,
+                false,
+            );
+            assert_eq!(serde_json::to_value(&status).unwrap(), stable);
+        }
     }
 }
