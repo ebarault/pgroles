@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-15
+
 ### Upgrade notes
 
+- **Apply the 0.14 CRDs before upgrading the controller.** They add status fields only: `PostgresPolicy.status.lastAttemptedReconcileAt`, `PostgresPolicyCandidate.status.executionPreflight`, and a `members_options_changed` count in policy and plan change summaries. Chart values are unchanged.
 - **Blocked auto-apply plans stay `Pending`.** Under `approval: auto`, a plan the executor lacks the authority to apply is no longer marked `Approved`; it waits as `Pending`, referenced by `status.current_plan_ref`, until authority exists. Alerts or dashboards that read an `Approved` plan as "about to apply" should treat a `Pending` plan on a policy with `Ready=False/ExecutorAuthority` as blocked. A reviewer can deny it; under `approval: auto` that cancels the one plan, and use `approval: manual` or `suspend` to stop automatic execution.
 - **Recorded reviews are format v3.** `pgroles diff --review-out` writes `pgroles.review-artifact.v3`, which adds the `schema_owner_transfer` preflight check. The explorer and `pgroles_core::review_artifact` still open v2 files from 0.13. Tools that validate artifacts against the published JSON Schema need the regenerated one.
 - **`pgroles diff` warns about what `apply` would refuse.** It runs the same guards as `apply` and prints `Warning: apply would refuse this plan: …` for an adopt-mode ownership transfer that was not allowed. Pass `--allow-schema-owner-transfers` to `diff` when the apply it previews will pass it. Exit codes are unchanged.
@@ -26,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The operator's apply, its candidate previews, and the CLI's `apply` and `diff` evaluate one set of apply guards, so no preview can pass a plan the apply it predicts would refuse. `diff --review-out` records the ownership refusal as a failed `schema_owner_transfer` check.
 - Role-drop safety no longer describes another database's dependencies with this database's catalog, which could name an unrelated local object; it reports them by catalog and object id.
 - PG16+ membership option changes retain independent grantor edges and SET capabilities. Increases use proven ADMIN attribution; reductions use option revocation with RESTRICT, and changed or incomplete catalog expectations require replanning.
+- Every Kubernetes API request a reconcile makes must now finish, response body included, within 30 seconds. kube's own timeouts reset whenever a byte arrives and default to 295 seconds for watches, so a stalled request, such as the finalizer patch before a policy's first reconcile, or a response that trickles in, could hold the controller's single reconcile slot for minutes without logging anything. It now fails, is logged, and is retried. Watches keep kube's long timeouts.
+- A reconcile that finds nothing left to change retires every Pending or Approved plan of the policy's own, found by listing rather than through `status.current_plan_ref`. Previously it retired only the referenced plan, only when Pending, and only once: a failed supersede, or an Approved plan 0.13 left behind, stayed live with nothing pointing at it, never collected by retention, and held the policy's candidates at `AwaitingDecision` while the policy reported `InSync`. A failed retirement is now retried by the next converged reconcile.
 
 ### For library users
 
