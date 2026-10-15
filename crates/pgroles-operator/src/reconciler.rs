@@ -107,6 +107,10 @@ enum RetryClass {
 /// Errors that can occur during reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    #[error(transparent)]
+    MembershipPlanning(#[from] pgroles_inspect::MembershipPlanningError),
+    #[error(transparent)]
+    SqlRender(#[from] pgroles_core::sql::SqlRenderError),
     #[error("context error: {0}")]
     Context(#[from] Box<ContextError>),
 
@@ -631,6 +635,19 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
+        ReconcileError::SqlRender(_)
+        | ReconcileError::MembershipPlanning(pgroles_inspect::MembershipPlanningError::Options(
+            _,
+        )) => RetryClass::Slow,
+        ReconcileError::MembershipPlanning(pgroles_inspect::MembershipPlanningError::Database(
+            error,
+        )) => {
+            if sqlx_error_is_non_transient(error) {
+                RetryClass::Slow
+            } else {
+                RetryClass::Transient
+            }
+        }
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
@@ -1618,6 +1635,7 @@ async fn apply_under_lock(
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
+    changes = pgroles_inspect::resolve_membership_options(pool, changes, &current).await?;
     // The apply guards, shared with candidate previews so that a preview
     // reports exactly what this apply would refuse.
     //
@@ -3245,6 +3263,7 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::Revoke { .. } => summary.grants_revoked += 1,
         Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
         Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
+        Change::UpdateMemberOptions { .. } => summary.members_options_changed += 1,
         Change::AddMember { .. } => summary.members_added += 1,
         Change::RemoveMember { .. } => summary.members_removed += 1,
         Change::SetPassword { .. } => summary.passwords_set += 1,
@@ -3266,6 +3285,7 @@ pub(crate) fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> Chang
         + summary.grants_revoked
         + summary.default_privileges_set
         + summary.default_privileges_revoked
+        + summary.members_options_changed
         + summary.members_added
         + summary.members_removed
         + summary.passwords_set;
@@ -3763,6 +3783,8 @@ fn detect_policy_conflict_in_list(
 impl ReconcileError {
     fn reason(&self) -> &'static str {
         match self {
+            ReconcileError::MembershipPlanning(_) => "MembershipPlanningFailed",
+            ReconcileError::SqlRender(_) => "SqlRenderFailed",
             ReconcileError::ManifestExpansion(_)
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
@@ -4601,13 +4623,24 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
+            // An option-only change runs SQL too, so it counts toward the total
+            // the status message, print column and metric all report.
+            Change::UpdateMemberOptions {
+                role: "reader".to_string(),
+                member: "app".to_string(),
+                grantor: "pgroles_executor".to_string(),
+                inherit: Some(true),
+                admin: None,
+                binding: None,
+            },
         ];
 
         let summary = summarize_changes(&changes);
         assert_eq!(summary.roles_created, 1);
         assert_eq!(summary.schemas_created, 1);
         assert_eq!(summary.grants_added, 1);
-        assert_eq!(summary.total, 3);
+        assert_eq!(summary.members_options_changed, 1);
+        assert_eq!(summary.total, 4);
     }
 
     #[test]

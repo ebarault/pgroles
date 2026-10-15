@@ -344,6 +344,16 @@ pub struct MembershipEdge {
 // RoleGraph — the top-level state container
 // ---------------------------------------------------------------------------
 
+/// Options on one catalog membership grant.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct MembershipOptions {
+    pub inherit: bool,
+    pub admin: bool,
+    pub set: bool,
+}
+
 /// Complete state of managed roles, grants, default privileges, and memberships.
 ///
 /// Both the manifest expander and the database inspector produce this type.
@@ -393,6 +403,10 @@ pub struct RoleGraph {
     /// inspections leave it empty, which diffs into plain grantor-less
     /// revokes.
     pub membership_edge_grantors: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Per-grantor live membership options (PG16+). Unlike the effective
+    /// membership, these retain each independent edge's options so updates
+    /// can leave unrelated grantors and SET authority intact.
+    pub membership_edge_options: BTreeMap<(String, String), BTreeMap<String, MembershipOptions>>,
     /// Grantors recorded on each live object-privilege ACL entry for managed
     /// grantees, keyed by grant target, then grantor, holding that grantor's
     /// privileges. PostgreSQL's plain REVOKE removes only the entry of the
@@ -404,6 +418,20 @@ pub struct RoleGraph {
 }
 
 impl RoleGraph {
+    /// Per-grantor options for one membership, when they cover exactly the
+    /// recorded grantors. Snapshots and older inspections may carry grantors
+    /// without options, and planning must not guess the missing tuples.
+    pub fn complete_membership_options(
+        &self,
+        role: &str,
+        member: &str,
+    ) -> Option<&BTreeMap<String, MembershipOptions>> {
+        let key = (role.to_string(), member.to_string());
+        let grantors = self.membership_edge_grantors.get(&key)?;
+        let options = self.membership_edge_options.get(&key)?;
+        (!grantors.is_empty() && grantors.iter().eq(options.keys())).then_some(options)
+    }
+
     /// Resolve catalog-proven equivalent routine targets before comparing grants.
     pub fn resolve_routine_aliases<'a>(
         &'a self,
