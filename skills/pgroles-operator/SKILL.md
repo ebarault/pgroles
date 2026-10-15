@@ -86,6 +86,12 @@ privileges separately. See [operator connections](https://thepartly.github.io/pg
 for the full configuration. Azure policies share the Entra identity supplied by
 the operator pod environment; per-policy impersonation is not supported.
 
+Azure may attribute creator ADMIN memberships to `azuresu`; inspect and
+preserve their actual options. If CREATE ROLE followed by a self-ADMIN grant
+fails, separate role bootstrap from membership adoption and object-grant
+reconciliation. Token authentication success alone does not certify this SQL
+lifecycle. See the Azure connection guide for the observed constraint.
+
 Observe-only policies retain claims. A suspended policy returns before checking
 peers, but an active peer can still detect overlap with its claims.
 

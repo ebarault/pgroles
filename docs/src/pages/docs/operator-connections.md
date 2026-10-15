@@ -190,6 +190,15 @@ Azure, while declared memberships and grants can still refer to that role.
 Use a separate PostgreSQL role and `setRole` if the login identity needs the
 executor privileges described in [executor privileges](/docs/executor-privileges).
 
+Azure can attribute automatic creator ADMIN memberships to `azuresu`. Inspect
+and preserve their live options in the desired memberships; see
+[memberships](/docs/memberships). On Azure PostgreSQL 16, creating a role and
+explicitly granting ADMIN back to its creator in the same transaction can fail
+with `ADMIN option cannot be granted back to your own grantor`. Bootstrap role
+creation separately, then adopt the existing membership and reconcile object
+grants. Treat this SQL-authority constraint separately when validating token
+authentication and policy convergence.
+
 The CLI supports the same projected identity with
 `pgroles diff --azure-workload-identity --database-url 'postgres://pgroles-operator@myserver.postgres.database.azure.com/postgres?sslmode=verify-full'`.
 The flag also applies to `apply`, `inspect`, `generate`, and current-state
