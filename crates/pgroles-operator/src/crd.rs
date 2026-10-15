@@ -5,9 +5,8 @@
 //! database connection and reconciliation scheduling.
 
 use kube::{CustomResource, KubeSchema};
-use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pgroles_core::bounds::*;
@@ -562,8 +561,9 @@ pub struct ConnectionParams {
 }
 
 /// Provider-backed authentication for `connection.params`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "type")]
+#[schemars(transform = normalize_connection_auth_schema)]
 pub enum ConnectionAuth {
     /// Fetch a Cloud SQL IAM database login token using the GKE metadata
     /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
@@ -581,32 +581,57 @@ pub enum ConnectionAuth {
     /// Exchange the AKS projected service account token for an Entra access
     /// token accepted by Azure Database for PostgreSQL Flexible Server.
     #[serde(rename = "azure_workload_identity")]
-    AzureWorkloadIdentity {},
+    AzureWorkloadIdentity {
+        // Preserve misplaced provider fields so an old invalid object can be
+        // decoded by the watcher and rejected by its own reconcile.
+        #[serde(flatten)]
+        #[schemars(skip)]
+        unsupported_fields: BTreeMap<String, serde_json::Value>,
+    },
 }
 
-impl JsonSchema for ConnectionAuth {
-    fn schema_name() -> Cow<'static, str> {
-        "ConnectionAuth".into()
-    }
-
-    fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        // Kubernetes requires a property shared by enum variants to have an
-        // identical schema in every branch. A single structural schema keeps
-        // the discriminator stable; runtime validation checks GCP-only fields.
-        json_schema!({
-            "type": "object",
-            "required": ["type"],
-            "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["gcp_workload_identity", "azure_workload_identity"],
-                    "description": "Provider authentication mechanism."
-                },
-                "impersonateServiceAccount": {"type": "string", "nullable": true, "description": "Target Google service account to impersonate before requesting the\nCloud SQL login token. Omit to use the pod's bound identity."},
-                "scope": {"type": "string", "nullable": true, "description": "OAuth scope requested for the access token."}
+fn normalize_connection_auth_schema(schema: &mut schemars::Schema) {
+    // Build one structural object from the derived variants. kube cannot hoist
+    // different discriminator schemas; preserve every other derived field schema,
+    // including its documentation, instead of duplicating it by hand.
+    let mut properties = serde_json::Map::new();
+    let mut providers = Vec::new();
+    if let Some(serde_json::Value::Array(branches)) = schema.remove("oneOf") {
+        for branch in branches {
+            if let Some(fields) = branch
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (name, field) in fields {
+                    if name == "type" {
+                        if let Some(value) = field.get("const") {
+                            providers.push(value.clone());
+                        } else if let Some(values) =
+                            field.get("enum").and_then(serde_json::Value::as_array)
+                        {
+                            providers.extend(values.iter().cloned());
+                        }
+                    } else {
+                        properties.insert(name.clone(), field.clone());
+                    }
+                }
             }
-        })
+        }
     }
+    properties.insert(
+        "type".into(),
+        serde_json::json!({
+            "type": "string", "enum": providers,
+            "description": "Provider authentication mechanism."
+        }),
+    );
+    schema.insert("type".into(), "object".into());
+    schema.insert("properties".into(), properties.into());
+    schema.insert("required".into(), serde_json::json!(["type"]));
+    schema.insert("x-kubernetes-validations".into(), serde_json::json!([{
+        "rule": "self.type == 'gcp_workload_identity' || (!has(self.scope) && !has(self.impersonateServiceAccount))",
+        "message": "scope and impersonateServiceAccount are only supported with gcp_workload_identity"
+    }]));
 }
 
 impl ConnectionAuth {
@@ -615,7 +640,9 @@ impl ConnectionAuth {
             Self::GcpWorkloadIdentity { scope, .. } => scope
                 .as_deref()
                 .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE),
-            Self::AzureWorkloadIdentity { .. } => DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE,
+            Self::AzureWorkloadIdentity { .. } => {
+                unreachable!("gcp_scope requires GCP authentication")
+            }
         }
     }
 
@@ -654,17 +681,69 @@ mod azure_auth_tests {
     fn azure_auth_round_trips_and_has_distinct_cache_key() {
         let auth: ConnectionAuth =
             serde_json::from_str(r#"{"type":"azure_workload_identity"}"#).unwrap();
-        assert_eq!(auth, ConnectionAuth::AzureWorkloadIdentity {});
+        assert_eq!(
+            auth,
+            ConnectionAuth::AzureWorkloadIdentity {
+                unsupported_fields: BTreeMap::new()
+            }
+        );
         assert_eq!(auth.cache_key(), "azure_workload_identity");
         assert_eq!(
             serde_json::to_value(auth).unwrap(),
             serde_json::json!({"type":"azure_workload_identity"})
         );
+    }
+
+    #[test]
+    fn mixed_policy_list_decodes_and_only_invalid_azure_policy_is_rejected() {
+        for field in ["scope", "impersonateServiceAccount"] {
+            let connection: ConnectionSpec = serde_json::from_value(serde_json::json!({
+                "params": {
+                    "host": "server.postgres.database.azure.com", "dbname": "postgres",
+                    "username": "operator", "auth": {"type": "gcp_workload_identity"}
+                }
+            }))
+            .unwrap();
+            let valid =
+                PostgresPolicy::new("valid-gcp", super::tests::spec_with_connection(connection));
+            let mut invalid = serde_json::to_value(&valid).unwrap();
+            invalid["metadata"]["name"] = "invalid-azure".into();
+            invalid["spec"]["connection"]["params"]["auth"] = serde_json::json!({
+                "type": "azure_workload_identity", (field): "unexpected"
+            });
+            let list: kube::api::ObjectList<PostgresPolicy> =
+                serde_json::from_value(serde_json::json!({
+                    "apiVersion": "pgroles.io/v1alpha1", "kind": "PostgresPolicyList",
+                    "metadata": {}, "items": [valid, invalid]
+                }))
+                .expect("one invalid policy must not prevent the watch from decoding its list");
+            assert!(list.items[0].spec.validate_connection_spec().is_ok());
+            assert!(matches!(
+                list.items[1].spec.validate_connection_spec(),
+                Err(ConnectionValidationError::UnsupportedAuthField { field: rejected }) if rejected == field
+            ));
+        }
+    }
+
+    #[test]
+    fn crd_admission_restricts_gcp_fields_to_gcp_auth() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(PostgresPolicy::crd()).unwrap();
+        let auth = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["connection"]["properties"]["params"]["properties"]["auth"];
+        assert_eq!(
+            auth["x-kubernetes-validations"][0]["rule"],
+            "self.type == 'gcp_workload_identity' || (!has(self.scope) && !has(self.impersonateServiceAccount))"
+        );
+        assert_eq!(
+            auth["properties"]["type"]["enum"],
+            serde_json::json!(["gcp_workload_identity", "azure_workload_identity"])
+        );
         assert!(
-            serde_json::from_str::<ConnectionAuth>(
-                r#"{"type":"azure_workload_identity","scope":"unexpected"}"#
-            )
-            .is_err()
+            auth["properties"]["impersonateServiceAccount"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("requesting the\nCloud SQL")
         );
     }
 
@@ -980,6 +1059,9 @@ pub enum ConnectionValidationError {
     #[error("connection.params: password/passwordSecret are mutually exclusive with auth")]
     AuthWithPassword,
 
+    #[error("connection.params.auth: {field} is only supported with gcp_workload_identity")]
+    UnsupportedAuthField { field: String },
+
     #[error(
         "connection.params.setRole: \"{value}\" is not a valid PostgreSQL role identifier (must match {pattern})",
         pattern = SET_ROLE_PATTERN,
@@ -1058,6 +1140,12 @@ pub struct PostgresPolicyStatus {
     /// Last force-reconcile annotation value handled by the operator.
     #[serde(default, rename = "lastHandledReconcileAt")]
     pub last_handled_reconcile_at: Option<String>,
+
+    /// Last force-reconcile annotation value whose reconcile ran, whatever its
+    /// outcome — including a refusal or failure. Lock contention does not
+    /// count: that reconcile has not evaluated the policy yet.
+    #[serde(default, rename = "lastAttemptedReconcileAt")]
+    pub last_attempted_reconcile_at: Option<String>,
 
     /// Summary of changes applied in the last reconciliation.
     #[serde(default)]
@@ -1182,6 +1270,9 @@ pub struct ChangeSummary {
     #[serde(default)]
     /// Number of membership additions.
     pub members_added: i32,
+    #[serde(default)]
+    /// Number of grantor-attributed membership option changes.
+    pub members_options_changed: i32,
     #[serde(default)]
     /// Number of membership removals.
     pub members_removed: i32,
@@ -2203,7 +2294,15 @@ impl PostgresPolicySpec {
                                 });
                             }
                         }
-                        ConnectionAuth::AzureWorkloadIdentity { .. } => {}
+                        ConnectionAuth::AzureWorkloadIdentity { unsupported_fields } => {
+                            for field in ["scope", "impersonateServiceAccount"] {
+                                if unsupported_fields.contains_key(field) {
+                                    return Err(ConnectionValidationError::UnsupportedAuthField {
+                                        field: field.to_string(),
+                                    });
+                                }
+                            }
+                        }
                     }
                 } else {
                     validate_required_field("password", &params.password, &params.password_secret)?;
@@ -2958,6 +3057,13 @@ pub struct PostgresPolicyCandidateStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_ref: Option<PlanReference>,
 
+    /// Read-only apply preflight for the current review SQL: every guard that
+    /// would refuse to execute it. Absent when no current check is available.
+    /// Apply rechecks fresh state; NoKnownBlockers describes targeted checks,
+    /// not guaranteed SQL success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_preflight: Option<CandidateExecutionPreflight>,
+
     #[serde(default)]
     #[schemars(length(max = 16))]
     /// Controller observations about candidate validity, planning, approval, and promotion.
@@ -2967,6 +3073,79 @@ pub struct PostgresPolicyCandidateStatus {
     /// immutable, so this advances at most once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+}
+
+/// The apply preflight for a candidate's current review SQL.
+///
+/// It runs the guards the parent policy's apply runs, with the parent's
+/// execution settings, so a preview reports what promoting the candidate would
+/// meet. The evaluation fields bind the result to when, and against which
+/// parent state, it was computed, so a consumer can reject an old answer
+/// instead of inferring freshness from whether the object happens to be
+/// present.
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateExecutionPreflight {
+    /// Whether any apply guard would refuse to execute this SQL.
+    pub eligibility: ExecutionEligibility,
+    /// Known blockers, each naming the guard that raised it.
+    pub issues: Vec<ExecutionBlocker>,
+    /// RFC 3339 time the preflight ran. A consumer that needs a result newer
+    /// than some event (its own start, a migration, a restore) compares this.
+    pub evaluated_at: String,
+    /// The parent policy's `metadata.generation` during evaluation. A result
+    /// for an older generation does not describe the current parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_generation: Option<i64>,
+    /// The parent policy's state during evaluation.
+    pub parent_state: ParentEvaluationState,
+}
+
+/// Parent policy state a candidate preview was evaluated under.
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ParentEvaluationState {
+    /// The parent reconciled and holds no other actionable plan; the preview
+    /// is computed against the state the parent enforced.
+    Converged,
+    /// An apply guard refused the parent's own plan before any of it ran. The
+    /// preview is computed against the unchanged database, and promoting the
+    /// candidate replaces the blocked content: this is the state in which a
+    /// repair is reviewed.
+    ExecutionBlocked,
+}
+
+/// Whether the apply guards would let a candidate's SQL execute.
+#[derive(JsonSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionEligibility {
+    /// No apply guard reported a blocker; apply still rechecks.
+    NoKnownBlockers,
+    /// At least one apply guard would refuse to execute this SQL.
+    Blocked,
+}
+
+/// The apply guard that raised a blocker.
+#[derive(JsonSchema, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionGuard {
+    /// The executor lacks privileges a planned statement needs.
+    ExecutorAuthority,
+    /// Adopt mode would transfer schema ownership and the policy does not set
+    /// `allow_schema_owner_transfers`.
+    SchemaOwnerTransfer,
+    /// A planned role drop is unsafe: the role still owns objects, holds
+    /// privileges or has sessions that its retirement does not handle.
+    RoleDropSafety,
+}
+
+/// One known reason apply would refuse a candidate's SQL.
+#[derive(KubeSchema, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionBlocker {
+    /// The apply guard that raised this blocker.
+    pub guard: ExecutionGuard,
+    /// Stable kind within the guard.
+    pub code: String,
+    /// Readable explanation naming the affected roles or objects.
+    pub message: String,
 }
 
 /// Printable lifecycle summary for a candidate.
@@ -3005,6 +3184,8 @@ impl CandidatePhase {
 pub mod candidate_reason {
     /// `Ready=True` — a current plan exists for this candidate.
     pub const PLANNED: &str = "Planned";
+    /// `Ready=False` — review SQL exists, but an apply guard would refuse it.
+    pub const EXECUTION_BLOCKED: &str = "ExecutionBlocked";
     /// `Ready=True` — the content is already the database's state, so there is
     /// nothing to review. Not terminal: the content may diverge again.
     pub const NO_EFFECTS: &str = "NoEffects";

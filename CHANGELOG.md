@@ -12,6 +12,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Azure Database for PostgreSQL Flexible Server authentication through Microsoft Entra Workload Identity in the CLI and Kubernetes operator, with short-lived token acquisition and operator pool renewal.
 - AKS Workload Identity Helm settings and documentation for passwordless connections and externally managed Entra roles.
 
+## [0.14.0] - 2026-10-15
+
+### Highlights
+
+- **Candidate previews predict what apply will do.** A `PostgresPolicyCandidate` is now checked against every guard the operator runs before it applies a plan: executor authority, the adopt-mode schema ownership refusal, and role-drop safety. The checks use the parent policy's settings. A change apply would refuse now shows as `Ready=False` with reason `ExecutionBlocked` before you merge it, and `status.executionPreflight` lists each blocker and the guard that raised it. A candidate that repairs a blocked policy can be previewed while that policy is still blocked. (#248)
+- **`pgroles diff` warns about what `apply` would refuse.** `diff` and `apply --dry-run` run the same guards as `apply` and print `Warning: apply would refuse this plan: …`. `--review-out` records the schema ownership check in the review file. Exit codes are unchanged. (#248)
+- **Membership options change in place on PostgreSQL 16+.** Changing `inherit` or `admin` on a membership now changes that option alone. pgroles no longer revokes and re-grants the membership, so grants made by other roles, such as a cloud provider's administrator or a migration, stay as they are, and `SET` is left alone. A change the executor is not allowed to make is reported before any SQL runs, together with the fix; usually that is declaring the option as the database already has it. (#249)
+- **Blocked auto-apply plans wait instead of churning.** Under `approval: auto`, a plan the executor lacks the authority to apply waits as one `Pending` plan. 0.13 approved it, abandoned it, and opened an identical plan every few seconds. The waiting plan applies once the authority exists, and a reviewer can deny it. (#247)
+
+### Upgrade notes
+
+- **Apply the 0.14 CRDs before upgrading the controller.** The CRDs add status fields only, and chart values are unchanged. If a 0.14 controller runs against 0.13 CRDs, the API server drops the new fields without an error: candidates show no `executionPreflight`, and `pgroles reconcile --wait` waits out its timeout. See [Upgrading the operator](https://thepartly.github.io/pgroles/docs/operator-upgrades/). (#252)
+- **Alerts on plan phase.** A blocked auto-apply plan now stays `Pending`. Treat a `Pending` plan on a policy reporting `Ready=False` with reason `ExecutorAuthority` as blocked, not as waiting for a reviewer. Denying the plan cancels it. To stop automatic execution, use `approval: manual` or `suspend`. (#247)
+- **Expect new plans for PostgreSQL 16+ memberships.** Where a policy's `inherit` or `admin` differs from the database, the first plan after upgrading uses the new per-grantor SQL. Review it before approving. (#249)
+- **Plans left behind by 0.13 are retired.** Once a policy has nothing left to change, 0.14 supersedes any of its plans that are still `Pending` or `Approved`, including ones 0.13 approved and abandoned. Candidates those plans were holding at `AwaitingDecision` move on. (#252)
+- **Recorded reviews are format v3.** `pgroles diff --review-out` writes `pgroles.review-artifact.v3`. The explorer still opens v2 files from 0.13. Tools that validate review files against the published JSON Schema need the regenerated schema. (#248)
+- **`pgroles reconcile --wait` fails fast.** Against a 0.14 operator it exits with an error naming the policy's `Ready` reason as soon as the requested reconcile has run without succeeding, instead of waiting out its timeout. Against an older operator it behaves as before. (#247)
+
+### Added
+
+- `pgroles diff --allow-schema-owner-transfers` evaluates the plan as `apply --allow-schema-owner-transfers` would. (#248)
+- `PostgresPolicy.status.lastAttemptedReconcileAt` records the requested reconcile the operator has run, whatever its outcome. Tooling can wait on it instead of guessing. `status.lastHandledReconcileAt` keeps its meaning: the request reconciled or produced a plan. (#247)
+
+### Fixed
+
+- **A stalled Kubernetes request could hold up reconciliation without logging anything.** Every Kubernetes request a reconcile makes now has to finish, response included, within 30 seconds. A stalled request fails, is logged, and is retried. Watches are unaffected. (#252)
+- **Plans nothing pointed at could block candidates indefinitely.** A plan whose retirement failed once, or an `Approved` plan from 0.13, stayed live with no reference to it. Plan retention never removed it, and it held the policy's candidates at `AwaitingDecision` while the policy reported `InSync`. Such plans are now retired, and a failed retirement is retried. (#252)
+- **Role-drop safety named the wrong objects for other databases.** It looked up another database's dependencies in the current database's catalog, which could name an unrelated local object. It now reports them by catalog and object id. (#248)
+- A candidate whose changes disappear drops its earlier preview result, and lock contention no longer withdraws one. (#248)
+
+### For library users
+
+- `pgroles_inspect::evaluate_execution_guards` runs the apply guards with `ExecutionSettings`; `ExecutionGuardFindings::blockers()` names the guard behind each blocker. (#248)
+- `pgroles_core::review_artifact` writes `pgroles.review-artifact.v3` and reads v2 and v3 (`READABLE_REVIEW_ARTIFACT_SCHEMA_VERSIONS`). `PreflightCheck` and `EvidenceCheck` gain `SchemaOwnerTransfer`. `pgroles_core::diff::adopt_schema_owner_transfers` lists the adopt-mode ownership transfers in a plan. (#248)
+- `pgroles_core::sql::render` and the other `render*` functions return `Result<_, SqlRenderError>`. Pass changes through `pgroles_inspect::resolve_membership_options` against the target database before rendering, as the CLI and operator do. A PostgreSQL 16+ membership option change from `diff()` cannot render until it is resolved. (#249)
+
 ## [0.13.0] - 2026-09-24
 
 ### Highlights

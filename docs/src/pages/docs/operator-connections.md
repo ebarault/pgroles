@@ -148,6 +148,12 @@ before expiry. No PostgreSQL password Secret is required. `password` and
 `passwordSecret` are rejected in this mode; omitted `sslMode` defaults to
 `verify-full` so the server certificate and hostname are checked.
 
+The Entra identity comes from the operator pod environment and is shared by all
+Azure policies handled by that operator. Per-policy impersonation is not
+supported; use separate operator deployments when different Entra identities
+are needed. `scope` and `impersonateServiceAccount` are GCP-only fields and are
+rejected for Azure authentication.
+
 ```yaml
 operator:
   serviceAccount:

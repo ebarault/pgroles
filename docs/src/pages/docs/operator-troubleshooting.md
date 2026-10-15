@@ -62,10 +62,12 @@ release or namespace names.
 | `InvalidDatabaseTarget` | A database grant names a database other than the one the connection reaches. Set `object.name` to `current_database()`. [Check database objects](#missing-database-objects). |
 | `InvalidRoutineTarget` | A function or procedure grant names a routine PostgreSQL cannot resolve. The message lists the input-type signatures to use. [Check database objects](#missing-database-objects). |
 | `InsufficientPrivileges` | The executor can connect but cannot inspect or apply an operation. [Check executor privileges](#executor-privileges). |
+| `ExecutorAuthority` | The authority preflight found a statement the executor cannot run, before any SQL executed. [Resolve the authority gap](#executor-authority-blocks-execution). |
 | `MissingDatabaseObject` | An external object referenced by the policy is absent. [Check database objects](#missing-database-objects). |
 | `UnsatisfiableWildcardGrant` | A wildcard matched objects the executor cannot grant on. [Check wildcard grants](#wildcard-grants). |
 | `ConflictingPolicy` | Two policies claim overlapping state on the same database. [Resolve the conflict](#policy-conflicts). |
 | `UnsafeRoleDrops` | A role drop is blocked by owned objects or other dependencies. [Plan a safe retirement](#unsafe-role-drops). |
+| `OwnerTransferBlocked` | An adopt-mode apply would transfer schema ownership the policy does not allow. [Decide the owner](#schema-ownership-transfer-refused). |
 | `Planned`, `Drifted=True`, plan `Pending` | A preview or manual approval gate is working. [Inspect the plan](#a-plan-does-not-execute). |
 | `ApprovalIgnored`, `ApprovalUnset` | Approval configuration is ineffective or implicit. [Fix the execution gates](#a-plan-does-not-execute). |
 | `ApplyFailed`, `DatabaseInspectionFailed` | A transient or uncategorized PostgreSQL operation failed. [Check transient failures](#transient-and-infrastructure-failures). |
@@ -166,6 +168,32 @@ sometimes `ADMIN OPTION`; object grants need ownership or `WITH GRANT OPTION`;
 default privileges need membership in their owner role. The complete matrix and
 bootstrap SQL are in [executor privileges](/docs/executor-privileges).
 
+### Executor authority blocks execution
+
+`ExecutorAuthority` means the read-only preflight found a planned statement the
+executor cannot run, and stopped before the first one. The whole plan waits —
+PostgreSQL applies it in one transaction — including changes the executor could
+make on their own. The message names each blocker; the commonest is a
+membership or object grant attributed to a grantor the executor cannot act as,
+such as a provider administrator on a managed service.
+
+Nothing has changed in the database, and reconciling again will not supply the
+missing authority. Under `approval: auto` the plan stays `Pending` with
+`status.current_plan_ref` pointing at it, and is reused until authority exists.
+Resolve it one of three ways:
+
+- change the policy so it no longer needs that statement — keep the edge, or
+  match the live membership options — and preview the change as a
+  [candidate](/docs/operator-candidates) first; candidates are still planned
+  while an apply guard blocks the policy
+- grant the executor the specific authority named, never broad provider
+  administration to get past the check
+- have someone holding that authority run the named statement once, then let
+  the next reconcile converge
+
+Denying the waiting plan stops that plan only; see [plan and
+approval](/docs/operator-plan-approval#what-executes-mode-and-approval-together).
+
 ## Missing database objects
 
 `InvalidDatabaseTarget` is narrower than a missing object: a `type: database`
@@ -228,6 +256,32 @@ executor has the required privilege.
 Review the generated SQL in observe mode before approving destructive retirement
 steps. Do not remove the safety blocker merely to make the policy green.
 
+## Schema ownership transfer refused
+
+`OwnerTransferBlocked` means an apply-mode policy in `adopt` reconciliation
+would run `ALTER SCHEMA ... OWNER TO` on a schema whose live owner differs from
+the declared one, and the policy does not set
+`spec.allow_schema_owner_transfers`. Adopt mode filters role drops, not
+ownership convergence, so the refusal is what stops pgroles from taking a schema
+away from whatever system owns it now. The guard runs before the plan's single
+transaction: nothing executed, and every other change in the plan waits with it.
+
+Decide who should own the schema, then do one of these:
+
+- declare the current owner, so the policy no longer plans a transfer
+- set `spec.allow_schema_owner_transfers: true` on this policy, when the
+  transfer is intended — the flag is per policy, so allowing it in staging does
+  not allow it in production
+- transfer ownership out of band, with whatever else the transfer needs
+  (`CREATE` on the schema for the incoming owner's objects, for example), and
+  let the next reconcile find nothing to change
+
+Preview the change as a [candidate](/docs/operator-candidates) against each
+environment's policy first. Candidates run the same guard with that policy's
+settings, so a transfer the production policy would refuse shows as
+`ExecutionBlocked` before it merges, and a repair is still previewed while the
+policy is blocked.
+
 ## A plan does not execute
 
 ### Approval pending
@@ -245,7 +299,9 @@ kubectl get pgr "$POLICY" --namespace "$NAMESPACE" \
 - `mode: observe` computes plans but never executes mutating SQL
 - `mode: apply` with `approval: manual` waits for a terminal `Approved`
   decision on the current plan's status
-- `mode: apply` with `approval: auto` applies without a human gate
+- `mode: apply` with `approval: auto` applies without a human gate, once the
+  executor has the authority the plan needs; until then the plan stays
+  `Pending` and the policy reports [`ExecutorAuthority`](#executor-authority-blocks-execution)
 
 Follow the current plan and inspect its phase and conditions:
 

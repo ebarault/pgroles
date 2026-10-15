@@ -62,6 +62,7 @@ pgroles diff --bundle path/to/pgroles.bundle.yaml --database-url postgres://loca
 | `--mode` | Reconciliation mode: `authoritative` (default), `additive`, or `adopt` |
 | `--exit-code` | Exit with code 2 when drift is detected (default: `true`) |
 | `--no-exit-code` | Suppress drift exit code 2; command failures still exit nonzero |
+| `--allow-schema-owner-transfers` | Evaluate the plan as `apply --allow-schema-owner-transfers` would. Without it, an adopt-mode schema ownership transfer is reported as one `apply` refuses |
 | `--review-out` | Write a sanitized recorded review artifact alongside normal output |
 | `--target-label` | Human-readable target label for `--review-out`, such as `staging`; a value containing `://` is rejected |
 | `--policy-commit` | Source revision to record with `--review-out` |
@@ -156,7 +157,9 @@ pgroles apply --bundle path/to/pgroles.bundle.yaml --database-url postgres://loc
 
 `apply` executes the plan inside a single database transaction. Individual changes may still render to multiple SQL statements internally, but the whole apply either commits or rolls back together.
 
-In adopt mode, apply **refuses** a plan that would transfer schema ownership (`ALTER SCHEMA ... OWNER TO ...`) unless `--allow-schema-owner-transfers` is passed — adopt filters role drops, not ownership convergence, and a silent transfer away from a live owner has broken brownfield rollouts before. `diff --mode adopt` warns instead of refusing, so CI drift checks keep working.
+In adopt mode, apply **refuses** a plan that would transfer schema ownership (`ALTER SCHEMA ... OWNER TO ...`) unless `--allow-schema-owner-transfers` is passed — adopt filters role drops, not ownership convergence, and a silent transfer away from a live owner has broken brownfield rollouts before.
+
+`apply` runs three guards before it executes anything: this ownership refusal, [executor authority](/docs/executor-privileges), and role-drop safety. `diff` and `apply --dry-run` run the same guards with the same settings but only warn, so CI drift checks keep working while the report says exactly what the apply would refuse: `diff` prints `Warning: apply would refuse this plan: …`, and `--review-out` records each guard as preflight evidence. Pass `--allow-schema-owner-transfers` to `diff` when the apply it previews will pass it. The operator evaluates policies and [candidate previews](/docs/operator-candidates) through the same guards.
 
 Before executing changes, `apply` detects the connecting role's privilege level — true superuser, cloud provider superuser (for the explicitly supported providers), or regular user — and warns about any planned changes that exceed the detected privileges (for example setting `SUPERUSER` or `BYPASSRLS` through a managed-service admin role).
 
@@ -317,14 +320,14 @@ pgroles reconcile my-policy -n platform
 pgroles reconcile postgrespolicy/my-policy -n platform --wait
 ```
 
-The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger and mirrors the value to `status.lastHandledReconcileAt` after a successful reconcile or plan.
+The command patches the policy annotation `reconcile.pgroles.io/requestedAt` with the current RFC 3339 timestamp. The operator treats a new annotation value as an immediate reconcile trigger. It mirrors the value to `status.lastAttemptedReconcileAt` once that reconcile has run, whatever its outcome, and to `status.lastHandledReconcileAt` when it reconciled or produced a plan.
 
 ### Options
 
 | Flag | Description |
 |---|---|
 | `-n`, `--namespace` | Kubernetes namespace containing the `PostgresPolicy` (default: `default`) |
-| `--wait` | Poll the policy until `status.lastHandledReconcileAt` reaches the requested timestamp |
+| `--wait` | Wait until the operator has run the request. Succeeds when `status.lastHandledReconcileAt` reaches the requested timestamp; fails with the policy's `Ready` reason and message as soon as `status.lastAttemptedReconcileAt` shows the request ran without succeeding, for example `ExecutorAuthority` |
 | `--timeout` | Maximum wait duration, e.g. `30s`, `2m`, or `1m30s` (default: `2m`). Requires `--wait` |
 
 ## candidate

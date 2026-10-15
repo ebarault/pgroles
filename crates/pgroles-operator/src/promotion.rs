@@ -770,27 +770,14 @@ pub async fn record_promotion(
         "content promoted into policy {} and applied{plan_note}",
         policy.name_any()
     );
-    let namespace = candidate.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let api: Api<PostgresPolicyCandidate> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let mut status = candidate.status.clone().unwrap_or_default();
-    status.phase = CandidatePhase::Promoted;
-    set_condition_in(
-        &mut status.conditions,
-        promoted_condition(true, candidate_reason::PROMOTED, &message),
-    );
-    set_condition_in(
-        &mut status.conditions,
-        ready_condition(true, candidate_reason::PROMOTED, &message),
-    );
-    api.patch_status(
-        &promoted_name,
-        &PatchParams::apply("pgroles-operator"),
-        &Patch::Merge(&serde_json::json!({ "status": status })),
-    )
+    let mut candidate = candidate.clone();
+    crate::candidate::write_status(ctx, &mut candidate, |status| {
+        mark_promoted(status, &message)
+    })
     .await?;
     crate::events::publish_candidate_event(
         &ctx.event_recorder,
-        candidate,
+        &candidate,
         false,
         candidate_reason::PROMOTED,
         message,
@@ -803,6 +790,29 @@ pub async fn record_promotion(
         "candidate promoted"
     );
     Ok(())
+}
+
+fn mark_promoted(status: &mut crate::crd::PostgresPolicyCandidateStatus, message: &str) {
+    status.phase = CandidatePhase::Promoted;
+    status.execution_preflight = None;
+    set_condition_in(
+        &mut status.conditions,
+        promoted_condition(true, candidate_reason::PROMOTED, message),
+    );
+    set_condition_in(
+        &mut status.conditions,
+        ready_condition(true, candidate_reason::PROMOTED, message),
+    );
+}
+
+#[cfg(test)]
+fn promoted_status(
+    candidate: &PostgresPolicyCandidate,
+    message: &str,
+) -> crate::crd::PostgresPolicyCandidateStatus {
+    let mut status = candidate.status.clone().unwrap_or_default();
+    mark_promoted(&mut status, message);
+    status
 }
 
 async fn report(
@@ -845,20 +855,15 @@ async fn set_candidate_condition(
             c.condition_type == condition.condition_type && c.reason.as_deref() == Some(reason)
         })
     });
-    let namespace = candidate.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let api: Api<PostgresPolicyCandidate> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let mut status = candidate.status.clone().unwrap_or_default();
-    set_condition_in(&mut status.conditions, condition);
-    api.patch_status(
-        &candidate.name_any(),
-        &PatchParams::apply("pgroles-operator"),
-        &Patch::Merge(&serde_json::json!({ "status": status })),
-    )
+    let mut candidate = candidate.clone();
+    crate::candidate::write_status(ctx, &mut candidate, |status| {
+        set_condition_in(&mut status.conditions, condition.clone())
+    })
     .await?;
     if !already {
         crate::events::publish_candidate_event(
             &ctx.event_recorder,
-            candidate,
+            &candidate,
             warning,
             reason,
             message.to_string(),
@@ -1295,5 +1300,35 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn promotion_clears_previous_execution_preflight_before_becoming_terminal() {
+        let mut object = PostgresPolicyCandidate::new(
+            "preview",
+            serde_json::from_value(serde_json::json!({"policyRef":{"name":"orders"},"content":{}}))
+                .unwrap(),
+        );
+        object.status = Some(crate::crd::PostgresPolicyCandidateStatus {
+            execution_preflight: Some(crate::crd::CandidateExecutionPreflight {
+                eligibility: crate::crd::ExecutionEligibility::NoKnownBlockers,
+                issues: vec![],
+                evaluated_at: "2026-10-14T00:00:00Z".to_string(),
+                parent_generation: Some(1),
+                parent_state: crate::crd::ParentEvaluationState::Converged,
+            }),
+            ..Default::default()
+        });
+        let status = promoted_status(&object, "applied");
+        assert_eq!(status.phase, CandidatePhase::Promoted);
+        assert!(status.execution_preflight.is_none());
+        object.metadata.uid = Some("preview-uid".into());
+        object.metadata.resource_version = Some("10".into());
+        assert!(
+            serde_json::to_value(&object).unwrap()["status"]
+                .get("executionPreflight")
+                .is_some()
+        );
+        let patch = crate::candidate::candidate_status_cas_patch(&object, &status).unwrap();
+        assert!(patch[2]["value"].get("executionPreflight").is_none());
     }
 }

@@ -19,6 +19,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` spec.connection ` | **object; required.** Database connection configuration. |
 | ` spec.connection.params ` | **object; optional.** Structured connection parameters. Each field is either a plain string or a reference to a Secret key. Mutually exclusive with &#96;secretRef&#96;. **Constraints:** ` {"nullable":true} `. |
 | ` spec.connection.params.auth ` | **object; optional.** Provider-backed authentication for connections that use short-lived credentials instead of a static PostgreSQL password. **Constraints:** ` {"nullable":true,"required":["type"]} `. |
+| ` spec.connection.params.auth ` | **CEL:** ` {"message":"scope and impersonateServiceAccount are only supported with gcp_workload_identity","rule":"self.type == 'gcp_workload_identity' \|\| (!has(self.scope) && !has(self.impersonateServiceAccount))"} `. Evaluated with self at this path; oldSelf refers to the previous value on update. |
 | ` spec.connection.params.auth.impersonateServiceAccount ` | **string; optional.** Target Google service account to impersonate before requesting the Cloud SQL login token. Omit to use the pod's bound identity. **Constraints:** ` {"nullable":true} `. |
 | ` spec.connection.params.auth.scope ` | **string; optional.** OAuth scope requested for the access token. **Constraints:** ` {"nullable":true} `. |
 | ` spec.connection.params.auth.type ` | **string; required.** Provider authentication mechanism. **Constraints:** ` {"enum":["gcp_workload_identity","azure_workload_identity"]} `. |
@@ -166,6 +167,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` status.change_summary.grants_added ` | **integer; optional.** Number of object privilege grant steps. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
 | ` status.change_summary.grants_revoked ` | **integer; optional.** Number of object privilege revoke steps. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
 | ` status.change_summary.members_added ` | **integer; optional.** Number of membership additions. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
+| ` status.change_summary.members_options_changed ` | **integer; optional.** Number of grantor-attributed membership option changes. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
 | ` status.change_summary.members_removed ` | **integer; optional.** Number of membership removals. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
 | ` status.change_summary.passwords_set ` | **integer; optional.** Number of password updates. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
 | ` status.change_summary.roles_altered ` | **integer; optional.** Number of role attribute or configuration changes. **Default:** ` 0 `. **Constraints:** ` {"format":"int32"} `. |
@@ -185,6 +187,7 @@ For workflows, see [operator guidance](/docs/operator), [approval](/docs/operato
 | ` status.content_digest ` | **string; optional.** Canonical digest of this policy's own content, computed by exactly the same function as a candidate's &#96;status.contentDigest&#96; (note the wire names differ: this status object serialises snake&#95;case, so the field is &#96;status.content&#95;digest&#96; here).  Promotion is recognised by comparing the two. The value is also the operator's memory of what the content was on the previous reconcile, which is how an edited-after-approval promotion is distinguished from a policy that simply has not changed while a candidate is under review. **Constraints:** ` {"nullable":true} `. |
 | ` status.current_plan_ref ` | **object; optional.** Reference to the current/latest plan for this policy. **Constraints:** ` {"nullable":true,"required":["name"]} `. |
 | ` status.current_plan_ref.name ` | **string; required.** Name of the PostgresPolicyPlan in the same namespace. |
+| ` status.lastAttemptedReconcileAt ` | **string; optional.** Last force-reconcile annotation value whose reconcile ran, whatever its outcome — including a refusal or failure. Lock contention does not count: that reconcile has not evaluated the policy yet. **Constraints:** ` {"nullable":true} `. |
 | ` status.lastHandledReconcileAt ` | **string; optional.** Last force-reconcile annotation value handled by the operator. **Constraints:** ` {"nullable":true} `. |
 | ` status.last_attempted_generation ` | **integer; optional.** The &#96;.metadata.generation&#96; that was last attempted. **Constraints:** ` {"format":"int64","nullable":true} `. |
 | ` status.last_error ` | **string; optional.** Last reconcile error message, if any. **Constraints:** ` {"nullable":true} `. |

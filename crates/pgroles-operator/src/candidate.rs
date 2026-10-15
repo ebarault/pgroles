@@ -59,7 +59,8 @@ use pgroles_core::overlap::{
 
 use crate::context::OperatorContext;
 use crate::crd::{
-    CandidatePhase, CandidateTarget, ConnectionSpec, DatabaseIdentity, PlanPhase, PlanReference,
+    CandidateExecutionPreflight, CandidatePhase, CandidateTarget, ConnectionSpec, DatabaseIdentity,
+    ExecutionBlocker, ExecutionEligibility, ParentEvaluationState, PlanPhase, PlanReference,
     PolicyCondition, PostgresPolicy, PostgresPolicyCandidate, PostgresPolicyCandidateStatus,
     PostgresPolicyPlan, SecretReference, candidate_reason, is_retention_exempt, ready_condition,
     set_condition_in, superseded_condition,
@@ -110,6 +111,10 @@ pub enum BlockCause {
     /// The policy's reconcile did not converge: failing, suspended, in
     /// conflict, or blocked on target identity.
     Unstable,
+    /// This candidate alone could not be evaluated this pass — adopting it or
+    /// reading its plans failed — so its previous result is withdrawn. The
+    /// parent is not at fault and the reason must not say it is.
+    CandidateUnavailable,
 }
 
 impl BlockCause {
@@ -123,33 +128,112 @@ impl BlockCause {
                 "the active policy is not converging, so there is no post-enforcement state to \
                  plan this candidate against"
             }
+            BlockCause::CandidateUnavailable => {
+                "this candidate could not be evaluated this pass, so its previous result is \
+                 withdrawn; it is re-planned on the next reconcile"
+            }
         }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            BlockCause::AwaitingDecision | BlockCause::Unstable => {
+                candidate_reason::BLOCKED_BY_ACTIVE_POLICY
+            }
+            BlockCause::CandidateUnavailable => candidate_reason::PLANNING_FAILED,
+        }
+    }
+
+    fn is_warning(self) -> bool {
+        true
     }
 }
 
 /// Whether the parent's just-finished reconcile permits candidate planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParentGate {
-    Stable,
+    /// Candidates are planned, and record the parent state they were planned
+    /// under.
+    Open(ParentEvaluationState),
     Blocked(BlockCause),
 }
 
-/// Decide the gate from the two facts the parent's reconcile leaves behind.
+/// How the parent's own reconcile ended, as far as candidate planning cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentOutcome {
+    /// Reconciled, or planned in observe/manual mode.
+    Converged,
+    /// An apply guard refused the plan: executor authority, an adopt-mode
+    /// schema ownership transfer, or an unsafe role drop. The guards precede
+    /// the plan's single transaction, so nothing executed, and the parent
+    /// still holds both database locks.
+    ExecutionBlocked,
+    /// Any other outcome that still reached the locked phase.
+    Unstable,
+}
+
+/// Decide the gate from the facts the parent's reconcile leaves behind.
 ///
 /// The spec says a candidate is blocked when the parent "is failing or awaiting
-/// its own approval". That maps onto two observable facts and nothing else:
-/// the reconcile reached a converged outcome, and no plan of the policy's own
-/// is still actionable. `mode: observe` therefore blocks candidates exactly
-/// while it holds pending changes, and lets them through when it is in sync —
-/// which is the honest reading, since an observe-mode policy never executes
-/// and its "post-enforcement state" is simply the database as it stands.
-pub fn parent_gate(converged: bool, has_actionable_plan: bool) -> ParentGate {
-    if !converged {
-        ParentGate::Blocked(BlockCause::Unstable)
-    } else if has_actionable_plan {
-        ParentGate::Blocked(BlockCause::AwaitingDecision)
-    } else {
-        ParentGate::Stable
+/// its own approval". That maps onto two observable facts: the reconcile
+/// reached a converged outcome, and no plan of the policy's own is still
+/// actionable. `mode: observe` therefore blocks candidates exactly while it
+/// holds pending changes, and lets them through when it is in sync — which is
+/// the honest reading, since an observe-mode policy never executes and its
+/// "post-enforcement state" is simply the database as it stands.
+///
+/// A parent whose plan an apply guard refused is the exception, and the case a
+/// repair is filed for. Its content is the content that cannot run, so the
+/// database is not about to move under the candidate, and the state it is
+/// planned against is the database as it stands. Blocking candidates here
+/// would leave every repair without a preview exactly when one is needed.
+pub fn parent_gate(parent: ParentOutcome, has_actionable_plan: bool) -> ParentGate {
+    match parent {
+        ParentOutcome::Unstable => ParentGate::Blocked(BlockCause::Unstable),
+        ParentOutcome::ExecutionBlocked => {
+            ParentGate::Open(ParentEvaluationState::ExecutionBlocked)
+        }
+        ParentOutcome::Converged if has_actionable_plan => {
+            ParentGate::Blocked(BlockCause::AwaitingDecision)
+        }
+        ParentOutcome::Converged => ParentGate::Open(ParentEvaluationState::Converged),
+    }
+}
+
+/// When, and against which parent state, one candidate pass evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Evaluation {
+    evaluated_at: String,
+    parent_generation: Option<i64>,
+    parent_state: ParentEvaluationState,
+}
+
+impl Evaluation {
+    fn preflight(
+        &self,
+        eligibility: ExecutionEligibility,
+        issues: Vec<ExecutionBlocker>,
+    ) -> CandidateExecutionPreflight {
+        CandidateExecutionPreflight {
+            eligibility,
+            issues,
+            evaluated_at: self.evaluated_at.clone(),
+            parent_generation: self.parent_generation,
+            parent_state: self.parent_state,
+        }
+    }
+
+    /// Appended to Ready messages, so a reviewer reading only the condition
+    /// knows the preview is a repair of a blocked policy.
+    fn parent_note(&self) -> &'static str {
+        match self.parent_state {
+            ParentEvaluationState::Converged => "",
+            ParentEvaluationState::ExecutionBlocked => {
+                "; the active policy's own plan was refused before it executed, so this preview \
+                 is computed against the unchanged database and promoting it replaces the \
+                 blocked content"
+            }
+        }
     }
 }
 
@@ -174,6 +258,13 @@ pub struct CandidatePlanning<'a> {
 enum CandidateOutcome {
     /// A plan exists (fresh or deduplicated) holding these effects.
     Planned { plan_name: String, changes: i32 },
+    /// SQL remains reviewable, but an apply guard would refuse to execute it.
+    ExecutionBlocked {
+        plan_name: String,
+        changes: i32,
+        message: String,
+        issues: Vec<ExecutionBlocker>,
+    },
     /// The content produces no changes at all — nothing to review.
     NoEffects,
     /// A plan exists, but an ephemeral overlay touches the same
@@ -261,6 +352,86 @@ fn classify_open_candidates(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Invalidate previous preview eligibility when parent evaluation cannot run.
+/// This uses only Kubernetes status: no database connection, inspection,
+/// adoption, plan mutation or SQL is needed on parent failure/suspension paths.
+pub(crate) async fn invalidate_parent_evaluation(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+) -> Result<(), ReconcileError> {
+    let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
+    let api: Api<PostgresPolicyCandidate> = Api::namespaced(ctx.kube_client.clone(), &namespace);
+    // One candidate's failure must not leave its siblings showing eligibility
+    // that is no longer current, so each is attempted independently.
+    for mut candidate in api.list(&ListParams::default()).await? {
+        if candidate_belongs_to(&candidate, policy) && needs_parent_invalidation(&candidate) {
+            invalidate_candidate_best_effort(ctx, policy, &mut candidate, BlockCause::Unstable)
+                .await;
+        }
+    }
+    Ok(())
+}
+
+async fn invalidate_candidate_best_effort(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    candidate: &mut PostgresPolicyCandidate,
+    cause: BlockCause,
+) {
+    if needs_parent_invalidation(candidate)
+        && let Err(err) = invalidate_if_current(ctx, policy, candidate, cause).await
+    {
+        tracing::warn!(candidate = %candidate.name_any(), %err,
+            "could not clear unavailable candidate eligibility");
+    }
+}
+
+async fn invalidate_if_current(
+    ctx: &OperatorContext,
+    policy: &PostgresPolicy,
+    candidate: &mut PostgresPolicyCandidate,
+    cause: BlockCause,
+) -> Result<(), ReconcileError> {
+    let original_uid = candidate.metadata.uid.clone();
+    if !invalidation_still_current(original_uid.as_deref(), candidate, policy) {
+        return Ok(());
+    }
+    let already_blocked = is_blocked(candidate, cause);
+    let wrote = write_candidate_status(
+        ctx,
+        candidate,
+        |status| set_blocked_condition(status, cause),
+        |fresh| invalidation_still_current(original_uid.as_deref(), fresh, policy),
+    )
+    .await?;
+    if wrote && !already_blocked {
+        publish_block_event(ctx, candidate, cause).await;
+    }
+    Ok(())
+}
+
+fn invalidation_still_current(
+    uid: Option<&str>,
+    candidate: &PostgresPolicyCandidate,
+    policy: &PostgresPolicy,
+) -> bool {
+    uid.is_some()
+        && candidate.metadata.uid.as_deref() == uid
+        && candidate_belongs_to(candidate, policy)
+        && needs_parent_invalidation(candidate)
+}
+
+fn needs_parent_invalidation(candidate: &PostgresPolicyCandidate) -> bool {
+    !candidate_phase(candidate).is_terminal()
+        && candidate.status.as_ref().is_some_and(|status| {
+            status.execution_preflight.is_some()
+                || status
+                    .conditions
+                    .iter()
+                    .any(|c| c.condition_type == "Ready" && c.status == "True")
+        })
+}
+
 /// Plan every non-terminal candidate of `policy`, then run candidate retention.
 ///
 /// Called from the parent's reconcile while its locks are still held. Failures
@@ -295,6 +466,7 @@ pub async fn reconcile_candidates(
     });
 
     let overlay_pairs = membership_overlay_pairs(planning.overlay_edges);
+    let evaluated_at = crate::crd::now_rfc3339();
 
     // Which candidates are not planned this pass — abandoned past the TTL, or
     // past the open-candidate budget. Decided before the shared read so an
@@ -313,8 +485,15 @@ pub async fn reconcile_candidates(
             tracing::warn!(
                 candidate = %candidate.name_any(),
                 %err,
-                "failed to adopt candidate; skipping this cycle"
+                "failed to adopt candidate; current eligibility is unavailable"
             );
+            invalidate_candidate_best_effort(
+                ctx,
+                policy,
+                candidate,
+                BlockCause::CandidateUnavailable,
+            )
+            .await;
             continue;
         }
 
@@ -357,8 +536,15 @@ pub async fn reconcile_candidates(
                 tracing::warn!(
                     candidate = %candidate.name_any(),
                     %err,
-                    "failed to read this candidate's plans; skipping this cycle"
+                    "failed to read this candidate's plans; current eligibility is unavailable"
                 );
+                invalidate_candidate_best_effort(
+                    ctx,
+                    policy,
+                    candidate,
+                    BlockCause::CandidateUnavailable,
+                )
+                .await;
                 continue;
             }
         };
@@ -373,10 +559,18 @@ pub async fn reconcile_candidates(
             continue;
         }
 
-        if let ParentGate::Blocked(cause) = planning.gate {
-            block_candidate(ctx, candidate, cause).await?;
-            continue;
-        }
+        let parent_state = match planning.gate {
+            ParentGate::Blocked(cause) => {
+                block_candidate(ctx, candidate, cause).await?;
+                continue;
+            }
+            ParentGate::Open(parent_state) => parent_state,
+        };
+        let evaluation = Evaluation {
+            evaluated_at: evaluated_at.clone(),
+            parent_generation: policy.metadata.generation,
+            parent_state,
+        };
 
         let planning_started_at = std::time::Instant::now();
         let outcome =
@@ -385,7 +579,18 @@ pub async fn reconcile_candidates(
             .record_candidate_planning(planning_started_at.elapsed());
         match outcome {
             Ok(outcome) => {
-                record_outcome(ctx, candidate, outcome).await?;
+                record_outcome(ctx, candidate, outcome, &evaluation).await?;
+            }
+            // A target override shares its database's locks with whatever
+            // else manages it. Contention there is as routine as it is for the
+            // parent, so the stamped result stands until the next pass.
+            Err(ReconcileError::LockContention(database, reason)) => {
+                tracing::debug!(
+                    candidate = %candidate.name_any(),
+                    %database,
+                    %reason,
+                    "candidate target is locked; keeping its previous result"
+                );
             }
             Err(err) => {
                 let message = err.to_string();
@@ -577,7 +782,7 @@ async fn shared_inspection(
     candidates: &[PostgresPolicyCandidate],
     not_planned: &BTreeMap<String, NotPlanned>,
 ) -> SharedInspection {
-    if !matches!(planning.gate, ParentGate::Stable) {
+    if !matches!(planning.gate, ParentGate::Open(_)) {
         return SharedInspection::none();
     }
 
@@ -716,6 +921,7 @@ async fn plan_against_target(
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
 
+    changes = pgroles_inspect::resolve_membership_options(target.pool(), changes, &current).await?;
     let summary = crate::reconciler::summarize_changes(&changes);
 
     if changes.is_empty() {
@@ -725,6 +931,28 @@ async fn plan_against_target(
         supersede_candidate_plan(ctx, candidate, namespace, SupersedeCause::EffectsCleared).await?;
         return Ok(CandidateOutcome::NoEffects);
     }
+
+    // Run the guards apply runs, on this target, against these final filtered
+    // effects, under the parent's execution settings — the settings promotion
+    // keeps. Preserve the review plan even when execution would be refused;
+    // promotion's apply still rechecks against fresh state.
+    let findings = crate::reconciler::evaluate_execution_guards(
+        target.pool(),
+        policy,
+        reconciliation_mode,
+        &changes,
+        &current,
+        &manifest.retirements,
+    )
+    .await?;
+    if !findings.drop_safety.warnings.is_empty() {
+        tracing::info!(candidate = %candidate.name_any(), warnings = %findings.drop_safety.warnings, "role-drop cleanup warnings");
+    }
+    let blockers: Vec<ExecutionBlocker> = findings
+        .blockers()
+        .into_iter()
+        .map(crate::reconciler::status_blocker)
+        .collect();
 
     let candidate_pairs = effect_pairs(&changes);
     let overlapping = intersecting_pairs(&candidate_pairs, overlay_pairs);
@@ -760,6 +988,7 @@ async fn plan_against_target(
             content_digest_encoding: pgroles_core::candidate::CANDIDATE_CONTENT_ENCODING_V1,
             base_content_digest: &base_content_digest,
         }),
+        crate::plan::PlanReuse::PendingOnly,
         false,
     )
     .await?;
@@ -775,6 +1004,30 @@ async fn plan_against_target(
         )
         .await
         .ok();
+    }
+
+    if !blockers.is_empty() {
+        let mut message = blockers
+            .iter()
+            .map(|blocker| blocker.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !overlapping.is_empty() {
+            message.push_str(&format!(
+                "\nActive ephemeral effects also overlap: {}",
+                overlapping
+                    .iter()
+                    .map(describe_pair)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(CandidateOutcome::ExecutionBlocked {
+            plan_name,
+            changes: summary.total,
+            message,
+            issues: blockers,
+        });
     }
 
     if !overlapping.is_empty() {
@@ -801,7 +1054,7 @@ enum CandidateTargetContext<'a> {
         pool: sqlx::PgPool,
         identity: DatabaseIdentity,
         target_identity: pgroles_core::approval::TargetIdentity,
-        _db_lock: crate::context::DatabaseLockGuard,
+        _db_lock: Option<crate::context::DatabaseLockGuard>,
         advisory_lock: Option<crate::advisory::AdvisoryLock>,
     },
 }
@@ -870,12 +1123,6 @@ async fn resolve_target<'a>(
 
     let connection = override_connection_spec(target);
     let identity = DatabaseIdentity::from_connection(namespace, &connection);
-    if identity.as_str() == planning.identity.as_str() {
-        // The override resolves to the parent's own target. Reusing the
-        // parent's context is not an optimisation — taking the same lock twice
-        // in one reconcile would deadlock against ourselves.
-        return Ok(CandidateTargetContext::Parent(planning));
-    }
 
     let pool = ctx
         .get_or_create_pool(namespace, &connection)
@@ -896,25 +1143,22 @@ async fn resolve_target<'a>(
         .await
         .map_err(Box::new)?;
 
-    // The override aliases the parent's own database only on proof of
-    // *endpoint* identity: the resolved host, port and database fingerprint.
-    // The physical identity deliberately plays no part here — it names a
-    // storage lineage, not an endpoint, so a streaming replica or a restored
-    // clone shares it (and the database name) with the parent while being
-    // exactly the different endpoint the override exists to preview. When the
-    // fingerprints match, the parent already holds both locks for this
-    // database, so reuse its context — like the string-identity fast path.
+    // Endpoint identity can share the parent's database locks, but says
+    // nothing about execution identity: credentials are deliberately omitted
+    // from this fingerprint. Always retain the resolved override pool.
     let same_logical_fingerprint =
         planning.target_identity.logical.as_deref() == Some(logical.as_str());
     if same_logical_fingerprint {
-        tracing::info!(
-            candidate = %candidate.name_any(),
-            policy = %policy.name_any(),
-            target = %identity.as_str(),
-            "candidate target override aliases the parent's own database; \
-             reusing the parent's context and locks"
-        );
-        return Ok(CandidateTargetContext::Parent(planning));
+        return Ok(CandidateTargetContext::Override {
+            pool,
+            identity,
+            target_identity: pgroles_core::approval::TargetIdentity {
+                physical,
+                logical: Some(logical),
+            },
+            _db_lock: None,
+            advisory_lock: None,
+        });
     }
 
     // Residual: an alias this detection cannot prove — a different hostname
@@ -964,7 +1208,7 @@ async fn resolve_target<'a>(
             physical,
             logical: Some(logical),
         },
-        _db_lock: db_lock,
+        _db_lock: Some(db_lock),
         advisory_lock,
     })
 }
@@ -1121,39 +1365,134 @@ async fn adopt_candidate(
 }
 
 /// Apply a status mutation to a candidate and write it back.
-async fn write_status<F>(
+///
+/// Never writes over a candidate that became terminal after `candidate` was
+/// read; see [`write_candidate_status`].
+pub(crate) async fn write_status<F>(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
     mutate: F,
 ) -> Result<(), ReconcileError>
 where
-    F: FnOnce(&mut PostgresPolicyCandidateStatus),
+    F: Fn(&mut PostgresPolicyCandidateStatus),
 {
+    let snapshot_terminal = candidate_phase(candidate).is_terminal();
+    write_candidate_status(ctx, candidate, mutate, |fresh| {
+        snapshot_terminal || !candidate_phase(fresh).is_terminal()
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Write a candidate's complete status, guarded by its UID and
+/// resourceVersion, and return whether the write landed.
+///
+/// The guard is what stops a stale snapshot reopening a superseded or promoted
+/// proposal, but it also fails on any unrelated metadata edit — a label, an
+/// annotation — made since the read. Such a conflict re-reads the candidate
+/// and re-applies `mutate` to the fresh status, while `still_wanted` holds for
+/// the fresh object; otherwise the write is abandoned (`Ok(false)`). A
+/// validation failure with unchanged preconditions is an error, not a race.
+pub(crate) async fn write_candidate_status<F, W>(
+    ctx: &OperatorContext,
+    candidate: &mut PostgresPolicyCandidate,
+    mutate: F,
+    still_wanted: W,
+) -> Result<bool, ReconcileError>
+where
+    F: Fn(&mut PostgresPolicyCandidateStatus),
+    W: Fn(&PostgresPolicyCandidate) -> bool,
+{
+    const ATTEMPTS: usize = 3;
     let namespace = candidate.namespace().ok_or(ReconcileError::NoNamespace)?;
     let api: Api<PostgresPolicyCandidate> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let mut status = candidate.status.clone().unwrap_or_default();
-    mutate(&mut status);
-    let patch = serde_json::json!({ "status": status });
-    let updated = api
-        .patch_status(
-            &candidate.name_any(),
-            &PatchParams::apply("pgroles-operator"),
-            &Patch::Merge(&patch),
-        )
-        .await?;
-    *candidate = updated;
-    Ok(())
+    let original_uid = candidate.metadata.uid.clone();
+    for _ in 0..ATTEMPTS {
+        let mut status = candidate.status.clone().unwrap_or_default();
+        // A parent block, planning failure, supersession or promotion must not
+        // keep an eligibility result from an older evaluation of review SQL.
+        status.execution_preflight = None;
+        mutate(&mut status);
+        let patch = candidate_status_cas_patch(candidate, &status)?;
+        let result = api
+            .patch_status(
+                &candidate.name_any(),
+                &PatchParams::apply("pgroles-operator"),
+                &Patch::<()>::Json(
+                    serde_json::from_value(patch)
+                        .map_err(|err| ReconcileError::InvalidSpec(err.to_string()))?,
+                ),
+            )
+            .await;
+        match result {
+            Ok(updated) => {
+                *candidate = updated;
+                return Ok(true);
+            }
+            Err(kube::Error::Api(error)) if error.code == 409 || error.code == 422 => {
+                let Some(fresh) = api.get_opt(&candidate.name_any()).await? else {
+                    return Ok(false);
+                };
+                if fresh.metadata.uid == candidate.metadata.uid
+                    && fresh.metadata.resource_version == candidate.metadata.resource_version
+                {
+                    return Err(ReconcileError::Kube(kube::Error::Api(error)));
+                }
+                if fresh.metadata.uid != original_uid || !still_wanted(&fresh) {
+                    *candidate = fresh;
+                    return Ok(false);
+                }
+                *candidate = fresh;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ReconcileError::InvalidSpec(format!(
+        "candidate {} status changed {ATTEMPTS} times while being written; retrying from fresh state",
+        candidate.name_any()
+    )))
+}
+
+pub(crate) fn candidate_status_cas_patch(
+    candidate: &PostgresPolicyCandidate,
+    status: &PostgresPolicyCandidateStatus,
+) -> Result<serde_json::Value, ReconcileError> {
+    let uid = candidate.metadata.uid.as_ref().ok_or_else(|| {
+        ReconcileError::InvalidSpec("persisted candidate UID required for status update".into())
+    })?;
+    let version = candidate
+        .metadata
+        .resource_version
+        .as_ref()
+        .ok_or_else(|| {
+            ReconcileError::InvalidSpec(
+                "persisted candidate resourceVersion required for status update".into(),
+            )
+        })?;
+    Ok(serde_json::json!([
+        {"op":"test","path":"/metadata/uid","value":uid},
+        {"op":"test","path":"/metadata/resourceVersion","value":version},
+        // Replace the complete status object: omitted optional fields clear
+        // previous values rather than surviving a merge patch.
+        {"op":"add","path":"/status","value":status}
+    ]))
 }
 
 async fn record_outcome(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
     outcome: CandidateOutcome,
+    evaluation: &Evaluation,
 ) -> Result<(), ReconcileError> {
+    let parent_note = evaluation.parent_note();
     match outcome {
         CandidateOutcome::Planned { plan_name, changes } => {
-            let message = format!("Plan {plan_name} holds {changes} change(s) for review");
+            let message = format!(
+                "Plan {plan_name} holds {changes} change(s) for review; execution preflight found no known blockers under the current parent settings (apply rechecks before execution){parent_note}"
+            );
             write_status(ctx, candidate, |status| {
+                status.execution_preflight =
+                    Some(evaluation.preflight(ExecutionEligibility::NoKnownBlockers, vec![]));
                 status.phase = CandidatePhase::Planned;
                 status.plan_ref = Some(PlanReference {
                     name: plan_name.clone(),
@@ -1165,13 +1504,39 @@ async fn record_outcome(
             })
             .await
         }
+        CandidateOutcome::ExecutionBlocked {
+            plan_name,
+            changes,
+            message,
+            issues,
+        } => {
+            let message = format!(
+                "Plan {plan_name} holds {changes} change(s) for review; execution is blocked{parent_note}:\n{message}"
+            );
+            write_status(ctx, candidate, |status| {
+                status.execution_preflight =
+                    Some(evaluation.preflight(ExecutionEligibility::Blocked, issues.clone()));
+                status.phase = CandidatePhase::Planned;
+                status.plan_ref = Some(PlanReference {
+                    name: plan_name.clone(),
+                });
+                set_condition_in(
+                    &mut status.conditions,
+                    ready_condition(false, candidate_reason::EXECUTION_BLOCKED, &message),
+                );
+            })
+            .await
+        }
         CandidateOutcome::NoEffects => {
-            let message =
-                "this candidate's content is already the database's state; nothing to review"
-                    .to_string();
+            let message = format!(
+                "this candidate's content is already the database's state; nothing to review{parent_note}"
+            );
             write_status(ctx, candidate, |status| {
                 status.phase = CandidatePhase::Planned;
                 status.plan_ref = None;
+                // There is no SQL to execute, so an earlier result about
+                // executing some no longer describes this candidate.
+                status.execution_preflight = None;
                 set_condition_in(
                     &mut status.conditions,
                     ready_condition(true, candidate_reason::NO_EFFECTS, &message),
@@ -1191,6 +1556,8 @@ async fn record_outcome(
                 overlapping.join(", "),
             );
             write_status(ctx, candidate, |status| {
+                status.execution_preflight =
+                    Some(evaluation.preflight(ExecutionEligibility::NoKnownBlockers, vec![]));
                 status.phase = CandidatePhase::Planned;
                 status.plan_ref = Some(PlanReference {
                     name: plan_name.clone(),
@@ -1257,41 +1624,53 @@ async fn mark_over_budget(
     Ok(())
 }
 
+fn is_blocked(candidate: &PostgresPolicyCandidate, cause: BlockCause) -> bool {
+    candidate.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|c| {
+            c.condition_type == "Ready"
+                && c.status == "False"
+                && c.reason.as_deref() == Some(cause.reason())
+        })
+    })
+}
+
+fn set_blocked_condition(status: &mut PostgresPolicyCandidateStatus, cause: BlockCause) {
+    set_condition_in(
+        &mut status.conditions,
+        ready_condition(false, cause.reason(), cause.message()),
+    );
+}
+
+async fn publish_block_event(
+    ctx: &OperatorContext,
+    candidate: &PostgresPolicyCandidate,
+    cause: BlockCause,
+) {
+    crate::events::publish_candidate_event(
+        &ctx.event_recorder,
+        candidate,
+        cause.is_warning(),
+        cause.reason(),
+        cause.message().to_string(),
+    )
+    .await
+    .ok();
+}
+
 async fn block_candidate(
     ctx: &OperatorContext,
     candidate: &mut PostgresPolicyCandidate,
     cause: BlockCause,
 ) -> Result<(), ReconcileError> {
-    let already_blocked = candidate.status.as_ref().is_some_and(|status| {
-        status.conditions.iter().any(|c| {
-            c.condition_type == "Ready"
-                && c.status == "False"
-                && c.reason.as_deref() == Some(candidate_reason::BLOCKED_BY_ACTIVE_POLICY)
-        })
-    });
+    let already_blocked = is_blocked(candidate, cause);
     write_status(ctx, candidate, |status| {
-        set_condition_in(
-            &mut status.conditions,
-            ready_condition(
-                false,
-                candidate_reason::BLOCKED_BY_ACTIVE_POLICY,
-                cause.message(),
-            ),
-        );
+        set_blocked_condition(status, cause)
     })
     .await?;
     // The parent can stay blocked for many cycles; one Event per transition is
     // the point of Events, a stream of identical ones is noise.
     if !already_blocked {
-        crate::events::publish_candidate_event(
-            &ctx.event_recorder,
-            candidate,
-            true,
-            candidate_reason::BLOCKED_BY_ACTIVE_POLICY,
-            cause.message().to_string(),
-        )
-        .await
-        .ok();
+        publish_block_event(ctx, candidate, cause).await;
     }
     Ok(())
 }
@@ -1975,21 +2354,84 @@ mod tests {
 
     #[test]
     fn the_gate_blocks_only_a_parent_that_has_not_finished_its_own_work() {
-        assert_eq!(parent_gate(true, false), ParentGate::Stable);
         assert_eq!(
-            parent_gate(true, true),
+            parent_gate(ParentOutcome::Converged, false),
+            ParentGate::Open(ParentEvaluationState::Converged)
+        );
+        assert_eq!(
+            parent_gate(ParentOutcome::Converged, true),
             ParentGate::Blocked(BlockCause::AwaitingDecision)
         );
         assert_eq!(
-            parent_gate(false, false),
+            parent_gate(ParentOutcome::Unstable, false),
             ParentGate::Blocked(BlockCause::Unstable)
         );
         // A failing parent is blocked whether or not a plan of its own is open;
         // "unstable" is the cause a reviewer needs to see first.
         assert_eq!(
-            parent_gate(false, true),
+            parent_gate(ParentOutcome::Unstable, true),
             ParentGate::Blocked(BlockCause::Unstable)
         );
+    }
+
+    fn test_preflight() -> CandidateExecutionPreflight {
+        Evaluation {
+            evaluated_at: "2026-10-14T00:00:00Z".to_string(),
+            parent_generation: Some(1),
+            parent_state: ParentEvaluationState::Converged,
+        }
+        .preflight(ExecutionEligibility::NoKnownBlockers, vec![])
+    }
+
+    #[test]
+    fn a_failure_confined_to_one_candidate_does_not_blame_the_parent() {
+        let cause = BlockCause::CandidateUnavailable;
+        assert_eq!(cause.reason(), candidate_reason::PLANNING_FAILED);
+        assert!(!cause.message().contains("active policy"));
+        for parent_cause in [BlockCause::AwaitingDecision, BlockCause::Unstable] {
+            assert_eq!(
+                parent_cause.reason(),
+                candidate_reason::BLOCKED_BY_ACTIVE_POLICY
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_refused_by_an_apply_guard_still_previews_its_repair() {
+        // Lost grantor authority or a disallowed schema transfer prevents
+        // the parent's plan from running; a repair changes the policy. Its
+        // open plan is the blocked one, so it must not hold the gate shut as
+        // an executable plan awaiting a decision would.
+        for has_actionable_plan in [false, true] {
+            assert_eq!(
+                parent_gate(ParentOutcome::ExecutionBlocked, has_actionable_plan),
+                ParentGate::Open(ParentEvaluationState::ExecutionBlocked)
+            );
+        }
+    }
+
+    #[test]
+    fn every_preflight_result_records_when_and_against_what_it_was_evaluated() {
+        let evaluation = Evaluation {
+            evaluated_at: "2026-10-14T00:00:00Z".to_string(),
+            parent_generation: Some(36),
+            parent_state: ParentEvaluationState::ExecutionBlocked,
+        };
+        let result = evaluation.preflight(ExecutionEligibility::NoKnownBlockers, vec![]);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["evaluatedAt"], "2026-10-14T00:00:00Z");
+        assert_eq!(json["parentGeneration"], 36);
+        assert_eq!(json["parentState"], "ExecutionBlocked");
+        assert!(
+            evaluation
+                .parent_note()
+                .contains("replaces the blocked content")
+        );
+        let converged = Evaluation {
+            parent_state: ParentEvaluationState::Converged,
+            ..evaluation
+        };
+        assert_eq!(converged.parent_note(), "");
     }
 
     #[test]
@@ -2125,6 +2567,7 @@ mod tests {
                 &changes,
                 &pgroles_core::sql::SqlContext::default(),
             )
+            .unwrap()
             .into_iter()
             .map(|statement| statement.redacted_sql)
             .collect::<Vec<_>>()
@@ -2432,5 +2875,133 @@ mod tests {
             pgroles_core::candidate::compute_content_digest(&candidate.spec.content)
         );
         assert!(content_digest(&candidate).starts_with("sha256:"));
+    }
+    #[test]
+    fn parent_invalidation_covers_ready_and_blocked_authority_without_touching_terminal_history() {
+        let mut object = candidate("preview", PolicyContent::default());
+        assert!(!needs_parent_invalidation(&object));
+        object.status = Some(PostgresPolicyCandidateStatus {
+            phase: CandidatePhase::Planned,
+            plan_ref: Some(PlanReference {
+                name: "review-sql".into(),
+            }),
+            execution_preflight: Some(test_preflight()),
+            conditions: vec![ready_condition(true, candidate_reason::PLANNED, "preview")],
+            ..Default::default()
+        });
+        assert!(needs_parent_invalidation(&object));
+        let status = object.status.as_mut().unwrap();
+        status.execution_preflight = None;
+        set_condition_in(
+            &mut status.conditions,
+            ready_condition(
+                false,
+                candidate_reason::BLOCKED_BY_ACTIVE_POLICY,
+                BlockCause::Unstable.message(),
+            ),
+        );
+        assert_eq!(status.plan_ref.as_ref().unwrap().name, "review-sql");
+
+        assert!(
+            !needs_parent_invalidation(&object),
+            "repeated parent failures must not churn status"
+        );
+        let status = object.status.as_mut().unwrap();
+        set_condition_in(
+            &mut status.conditions,
+            ready_condition(true, candidate_reason::NO_EFFECTS, "no SQL"),
+        );
+        assert!(
+            needs_parent_invalidation(&object),
+            "a prior NoEffects result is stale too"
+        );
+        object.status.as_mut().unwrap().phase = CandidatePhase::Promoted;
+        assert!(!needs_parent_invalidation(&object));
+    }
+    #[test]
+    fn invalidation_rechecks_identity_ownership_and_terminal_state() {
+        let parent = policy("orders");
+        let mut current = candidate("preview", PolicyContent::default());
+        current.metadata.uid = Some("preview-uid".into());
+        current.status = Some(PostgresPolicyCandidateStatus {
+            phase: CandidatePhase::Planned,
+            conditions: vec![ready_condition(true, candidate_reason::PLANNED, "ready")],
+            ..Default::default()
+        });
+        current.metadata.owner_references = Some(vec![policy_owner_reference(&parent)]);
+        assert!(invalidation_still_current(
+            Some("preview-uid"),
+            &current,
+            &parent
+        ));
+        let mut replacement_parent = parent.clone();
+        replacement_parent.metadata.uid = Some("replacement-parent".into());
+        assert!(!invalidation_still_current(
+            Some("preview-uid"),
+            &current,
+            &replacement_parent
+        ));
+        assert!(!invalidation_still_current(
+            Some("old-preview-uid"),
+            &current,
+            &parent
+        ));
+        current.status.as_mut().unwrap().phase = CandidatePhase::Promoted;
+        assert!(!invalidation_still_current(
+            Some("preview-uid"),
+            &current,
+            &parent
+        ));
+    }
+    #[test]
+    fn stale_invalidation_cannot_restore_a_superseded_or_promoted_candidate() {
+        let mut stale = candidate("c1", PolicyContent::default());
+        stale.metadata.uid = Some("c1-uid".into());
+        stale.metadata.resource_version = Some("10".into());
+        stale.status = Some(PostgresPolicyCandidateStatus {
+            phase: CandidatePhase::Planned,
+            execution_preflight: Some(test_preflight()),
+            conditions: vec![ready_condition(
+                true,
+                candidate_reason::PLANNED,
+                "review ready",
+            )],
+            ..Default::default()
+        });
+        let mut blocked = stale.status.clone().unwrap();
+        blocked.execution_preflight = None;
+        blocked.conditions = vec![ready_condition(
+            false,
+            candidate_reason::BLOCKED_BY_ACTIVE_POLICY,
+            "unavailable",
+        )];
+        let operations: json_patch::Patch =
+            serde_json::from_value(candidate_status_cas_patch(&stale, &blocked).unwrap()).unwrap();
+        for phase in [CandidatePhase::Superseded, CandidatePhase::Promoted] {
+            // Replica A has already listed Planned C1; replica B retires it
+            // before A's unlocked invalidation writes. Use the actual emitted
+            // RFC6902 operations, not a second implementation of the writer.
+            let mut fresh = stale.clone();
+            fresh.metadata.resource_version = Some("11".into());
+            fresh.status.as_mut().unwrap().phase = phase;
+            fresh.status.as_mut().unwrap().execution_preflight = None;
+            let mut document = serde_json::to_value(&fresh).unwrap();
+            let before = document.clone();
+            assert!(json_patch::patch(&mut document, &operations).is_err());
+            assert_eq!(
+                document, before,
+                "a failed CAS must not reopen a retired approval"
+            );
+            assert!(!needs_parent_invalidation(&fresh));
+        }
+        // Name reuse is also rejected, independently of resourceVersion.
+        let mut reused = serde_json::to_value(&stale).unwrap();
+        reused["metadata"]["uid"] = serde_json::json!("replacement-c1-uid");
+        assert!(json_patch::patch(&mut reused, &operations).is_err());
+        // A successful status replacement clears all omitted optional fields.
+        let mut original = serde_json::to_value(&stale).unwrap();
+        assert!(original["status"].get("executionPreflight").is_some());
+        json_patch::patch(&mut original, &operations).unwrap();
+        assert!(original["status"].get("executionPreflight").is_none());
     }
 }

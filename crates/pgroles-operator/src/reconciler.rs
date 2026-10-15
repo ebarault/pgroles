@@ -107,6 +107,10 @@ enum RetryClass {
 /// Errors that can occur during reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
+    #[error(transparent)]
+    MembershipPlanning(#[from] pgroles_inspect::MembershipPlanningError),
+    #[error(transparent)]
+    SqlRender(#[from] pgroles_core::sql::SqlRenderError),
     #[error("context error: {0}")]
     Context(#[from] Box<ContextError>),
 
@@ -122,7 +126,7 @@ pub enum ReconcileError {
     #[error("{0}")]
     UnsafeRoleDrops(String),
 
-    #[error("adopt mode would transfer schema ownership: {0}")]
+    #[error("{0}")]
     OwnerTransferBlocked(String),
 
     #[error("Kubernetes API error: {0}")]
@@ -179,6 +183,9 @@ pub enum ReconcileError {
 
     #[error("{0}")]
     ExecutorAuthority(String),
+
+    #[error("plan {0} carries a Denied decision and will not be approved or executed")]
+    PlanDenied(String),
 
     #[error("{0}")]
     ConflictingPolicy(String),
@@ -279,37 +286,58 @@ pub(crate) fn plan_advisory_warnings(
     warnings
 }
 
-/// The adopt-mode schema-ownership-transfer guard.
-///
-/// Returns the blocking message when an adopt plan would transfer ownership
-/// of any schema whose live owner differs, unless explicitly allowed. The
-/// CLI enforces the same rule behind `--allow-schema-owner-transfers`.
-pub(crate) fn adopt_owner_transfer_blocker(
-    mode: pgroles_core::diff::ReconciliationMode,
-    allow_schema_owner_transfers: bool,
+/// The execution settings `policy`'s apply runs with: whether it executes
+/// SQL, and whether adopt-mode schema ownership transfers are allowed. A
+/// candidate is evaluated with its parent's settings, which promotion keeps.
+pub(crate) fn execution_settings(policy: &PostgresPolicy) -> pgroles_inspect::ExecutionSettings {
+    pgroles_inspect::ExecutionSettings {
+        // The operator executes without a human reviewing the plan, so the
+        // CLI's flag-gated transfer refusal applies here too — but only when
+        // SQL will actually run. Observe policies keep producing plans for
+        // review regardless.
+        executes: matches!(policy.spec.mode, crate::crd::PolicyMode::Apply),
+        allow_schema_owner_transfers: policy.spec.allow_schema_owner_transfers,
+        transfer_allowance: "set spec.allow_schema_owner_transfers",
+    }
+}
+
+/// Run the apply guards shared with the CLI under `policy`'s execution
+/// settings. A policy's apply and its candidates' previews both call this.
+pub(crate) async fn evaluate_execution_guards(
+    pool: &sqlx::PgPool,
+    policy: &PostgresPolicy,
+    reconciliation_mode: pgroles_core::diff::ReconciliationMode,
     changes: &[pgroles_core::diff::Change],
-) -> Option<String> {
-    if mode != pgroles_core::diff::ReconciliationMode::Adopt || allow_schema_owner_transfers {
-        return None;
-    }
-    let transfers: Vec<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            pgroles_core::diff::Change::AlterSchemaOwner { name, owner } => {
-                Some(format!("\"{name}\" -> \"{owner}\""))
+    current: &pgroles_core::model::RoleGraph,
+    retirements: &[pgroles_core::manifest::RoleRetirement],
+) -> Result<pgroles_inspect::ExecutionGuardFindings, ReconcileError> {
+    Ok(pgroles_inspect::evaluate_execution_guards(
+        pool,
+        &execution_settings(policy),
+        reconciliation_mode,
+        changes,
+        current,
+        retirements,
+    )
+    .await?)
+}
+
+/// A blocker as candidate status reports it.
+pub(crate) fn status_blocker(
+    blocker: pgroles_inspect::ExecutionBlocker,
+) -> crate::crd::ExecutionBlocker {
+    use crate::crd::ExecutionGuard;
+    crate::crd::ExecutionBlocker {
+        guard: match blocker.guard {
+            pgroles_inspect::ExecutionGuard::ExecutorAuthority => ExecutionGuard::ExecutorAuthority,
+            pgroles_inspect::ExecutionGuard::SchemaOwnerTransfer => {
+                ExecutionGuard::SchemaOwnerTransfer
             }
-            _ => None,
-        })
-        .collect();
-    if transfers.is_empty() {
-        return None;
+            pgroles_inspect::ExecutionGuard::RoleDropSafety => ExecutionGuard::RoleDropSafety,
+        },
+        code: blocker.code,
+        message: blocker.message,
     }
-    Some(format!(
-        "{} schema(s): {}. Set spec.allow_schema_owner_transfers to permit this, \
-         use additive mode to skip transfers, or declare each schema's current owner.",
-        transfers.len(),
-        transfers.join(", ")
-    ))
 }
 
 async fn bounded_k8s_call<T, F>(call: &'static str, future: F) -> Result<T, ReconcileError>
@@ -607,6 +635,19 @@ fn retry_class(error: &finalizer::Error<ReconcileError>) -> RetryClass {
 
 fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
     match error {
+        ReconcileError::SqlRender(_)
+        | ReconcileError::MembershipPlanning(pgroles_inspect::MembershipPlanningError::Options(
+            _,
+        )) => RetryClass::Slow,
+        ReconcileError::MembershipPlanning(pgroles_inspect::MembershipPlanningError::Database(
+            error,
+        )) => {
+            if sqlx_error_is_non_transient(error) {
+                RetryClass::Slow
+            } else {
+                RetryClass::Transient
+            }
+        }
         ReconcileError::LockContention(_, _) => RetryClass::LockContention,
         // The watch resyncs on its own, so this clears without operator action.
         ReconcileError::RequestIndexNotReady(_) => RetryClass::Transient,
@@ -615,6 +656,7 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
         // Waiting out the plan's retry window is exactly the normal interval:
         // requeuing sooner would re-enter the back-off and re-defer.
         ReconcileError::PlanRetryDeferred(_, _)
+        | ReconcileError::PlanDenied(_)
         | ReconcileError::NonConvergentPlan(_)
         | ReconcileError::ManifestExpansion(_)
         | ReconcileError::InvalidInterval(_, _)
@@ -876,11 +918,23 @@ async fn reconcile_apply(
     let namespace = resource.namespace().ok_or(ReconcileError::NoNamespace)?;
     let identity = DatabaseIdentity::from_connection(&namespace, &resource.spec.connection);
 
-    match reconcile_apply_inner(resource, ctx, &identity).await {
+    let result = reconcile_apply_inner(resource, ctx, &identity).await;
+    // Connection/spec failures and early suspended/conflict exits never reach
+    // candidate planning under the database locks. Invalidate an earlier
+    // successful preview through status alone.
+    if candidate_evaluation_unavailable(&result) {
+        invalidate_candidate_results_best_effort(ctx, resource).await;
+    }
+    match result {
         Ok((action, outcome)) => {
-            if outcome.marks_requested_reconcile_handled() {
-                mark_requested_reconcile_handled(ctx, resource, requested_reconcile_at.as_deref())
-                    .await?;
+            if !matches!(outcome, ReconcileOutcome::LockContention) {
+                acknowledge_requested_reconcile(
+                    ctx,
+                    resource,
+                    requested_reconcile_at.as_deref(),
+                    outcome.marks_requested_reconcile_handled(),
+                )
+                .await?;
             }
             reconcile_guard.record_result(outcome.result(), outcome.reason());
             Ok(action)
@@ -918,6 +972,8 @@ async fn reconcile_apply(
                 _ => {}
             }
             reconcile_guard.record_result("error", error_reason);
+            // The attempt is acknowledged in the same write as the failure,
+            // so a reader that sees the acknowledgement sees this outcome.
             if let Err(status_err) = update_status(ctx, resource, |status| {
                 mark_reconcile_failure_status(
                     status,
@@ -926,6 +982,9 @@ async fn reconcile_apply(
                     is_transient_failure,
                     clear_current_plan_ref,
                 );
+                if let Some(requested) = requested_reconcile_at.as_deref() {
+                    status.last_attempted_reconcile_at = Some(requested.to_string());
+                }
             })
             .await
             {
@@ -936,6 +995,68 @@ async fn reconcile_apply(
     }
 }
 
+/// How the parent's reconcile ended, for candidate planning, if it reached the
+/// locked phase in a state candidates can be gated on at all.
+fn candidate_parent_outcome(
+    result: &Result<(Action, ReconcileOutcome), ReconcileError>,
+) -> Option<crate::candidate::ParentOutcome> {
+    use crate::candidate::ParentOutcome;
+    match result {
+        Ok((_, ReconcileOutcome::Reconciled | ReconcileOutcome::Planned)) => {
+            Some(ParentOutcome::Converged)
+        }
+        Ok(_) => Some(ParentOutcome::Unstable),
+        Err(err) if is_execution_guard_refusal(err) => Some(ParentOutcome::ExecutionBlocked),
+        Err(_) => None,
+    }
+}
+
+/// Whether an apply guard refused the parent's plan.
+///
+/// Each of these is raised only after the locked phase ran inspection, diff
+/// and [`evaluate_execution_guards`], and before any SQL: none of the plan
+/// executed, the database is as inspected, and both locks are still held. That
+/// is the state a repair is previewed against, so candidates are planned.
+fn is_execution_guard_refusal(err: &ReconcileError) -> bool {
+    matches!(
+        err,
+        ReconcileError::ExecutorAuthority(_)
+            | ReconcileError::OwnerTransferBlocked(_)
+            | ReconcileError::UnsafeRoleDrops(_)
+    )
+}
+
+/// Whether the reconcile ended without a current candidate evaluation, so an
+/// earlier one must be withdrawn.
+///
+/// Lock contention is deliberately excluded. It is routine when several
+/// policies share a database, and the policy holding the lock can change the
+/// database at any time whether or not this one is contended, so clearing on
+/// contention bought no freshness — it only made healthy previews flap.
+/// Every result carries `evaluatedAt` and `parentGeneration` instead, and a
+/// consumer that needs a newer answer compares them.
+fn candidate_evaluation_unavailable(
+    result: &Result<(Action, ReconcileOutcome), ReconcileError>,
+) -> bool {
+    match result {
+        Ok((
+            _,
+            ReconcileOutcome::Reconciled
+            | ReconcileOutcome::Planned
+            | ReconcileOutcome::LockContention,
+        )) => false,
+        Ok(_) => true,
+        Err(ReconcileError::LockContention(_, _)) => false,
+        Err(err) => !is_execution_guard_refusal(err),
+    }
+}
+
+async fn invalidate_candidate_results_best_effort(ctx: &OperatorContext, policy: &PostgresPolicy) {
+    if let Err(err) = crate::candidate::invalidate_parent_evaluation(ctx, policy).await {
+        tracing::warn!(policy = %policy.name_any(), %err, "could not invalidate candidate eligibility; current parent readiness must also be required by preview consumers");
+    }
+}
+
 fn requested_reconcile_at(resource: &PostgresPolicy) -> Option<String> {
     resource
         .annotations()
@@ -943,19 +1064,37 @@ fn requested_reconcile_at(resource: &PostgresPolicy) -> Option<String> {
         .cloned()
 }
 
-async fn mark_requested_reconcile_handled(
+/// Record that the reconcile requested at `requested_reconcile_at` ran.
+///
+/// `lastAttemptedReconcileAt` is written for every outcome that evaluated the
+/// policy, so a script can tell "ran and was refused" from "has not run yet".
+/// `lastHandledReconcileAt` keeps its narrower meaning: the request reconciled
+/// or produced a plan.
+async fn acknowledge_requested_reconcile(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
     requested_reconcile_at: Option<&str>,
+    handled: bool,
 ) -> Result<(), ReconcileError> {
     let Some(requested_reconcile_at) = requested_reconcile_at else {
         return Ok(());
     };
 
     update_status(ctx, resource, |status| {
-        status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+        status.last_attempted_reconcile_at = Some(requested_reconcile_at.to_string());
+        if handled {
+            status.last_handled_reconcile_at = Some(requested_reconcile_at.to_string());
+        }
     })
     .await
+}
+
+fn set_blocked_plan_ref(status: &mut PostgresPolicyStatus, plan_name: &str) {
+    // The summary stays on the review plan. Failure status clears the policy
+    // summary, so setting it here would add a needless Some -> None round trip.
+    status.current_plan_ref = Some(crate::crd::PlanReference {
+        name: plan_name.to_string(),
+    });
 }
 
 fn mark_reconcile_failure_status(
@@ -1213,13 +1352,10 @@ async fn reconcile_apply_inner(
     // post-enforcement state rather than the drift the policy just removed.
     // A candidate is a proposal, so nothing it does may break enforcement —
     // failures are recorded on the candidate and swallowed here.
-    if let Ok((_, outcome)) = &result
+    let parent_outcome = candidate_parent_outcome(&result);
+    if let Some(parent_outcome) = parent_outcome
         && let Some(target_identity) = handoff.target_identity.as_ref()
     {
-        let converged = matches!(
-            outcome,
-            ReconcileOutcome::Reconciled | ReconcileOutcome::Planned
-        );
         // An API failure here is not "no plan": treating it as one would open
         // the gate while the parent may in fact hold an actionable plan, and
         // the candidate would be planned against a state the database is not
@@ -1231,8 +1367,11 @@ async fn reconcile_apply_inner(
                     identity,
                     target_identity,
                     overlay_edges: &handoff.overlay_edges,
-                    gate: crate::candidate::parent_gate(converged, actionable.is_some()),
+                    gate: crate::candidate::parent_gate(parent_outcome, actionable.is_some()),
                 };
+                // Candidates written earlier in the pass hold current results,
+                // and the rest keep stamped ones a consumer can judge by age,
+                // so a failure partway through withdraws nothing.
                 if let Err(err) =
                     crate::candidate::reconcile_candidates(ctx, resource, &planning).await
                 {
@@ -1240,6 +1379,7 @@ async fn reconcile_apply_inner(
                 }
             }
             Err(err) => {
+                invalidate_candidate_results_best_effort(ctx, resource).await;
                 tracing::warn!(
                     name,
                     namespace,
@@ -1248,6 +1388,10 @@ async fn reconcile_apply_inner(
                 );
             }
         }
+    } else if parent_outcome.is_some() {
+        // No target handoff means there was no evaluation context in which
+        // an earlier candidate result could have been revalidated.
+        invalidate_candidate_results_best_effort(ctx, resource).await;
     }
 
     // Release advisory lock (always, even on error).
@@ -1484,20 +1628,6 @@ async fn apply_under_lock(
         tracing::warn!(name, namespace, warnings = ?plan_warnings, "plan advisory warnings");
     }
 
-    // Adopt-mode ownership transfer refusal: the operator executes without a
-    // human reviewing the plan, so the CLI's flag-gated refusal applies here
-    // too — but only when SQL will actually run. Observe policies keep
-    // producing plans for review regardless.
-    if matches!(resource.spec.mode, crate::crd::PolicyMode::Apply)
-        && let Some(blocker) = adopt_owner_transfer_blocker(
-            reconciliation_mode,
-            resource.spec.allow_schema_owner_transfers,
-            &changes,
-        )
-    {
-        return Err(ReconcileError::OwnerTransferBlocked(blocker));
-    }
-
     ctx.observability
         .record_processing_phase("diff", diff_started.elapsed());
 
@@ -1507,16 +1637,34 @@ async fn apply_under_lock(
     if !password_changes.is_empty() {
         changes = pgroles_core::diff::inject_password_changes(changes, &password_changes);
     }
-    let dropped_roles: Vec<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            pgroles_core::diff::Change::DropRole { name } => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    let drop_safety = pgroles_inspect::inspect_drop_role_safety(pool, &dropped_roles)
-        .await?
-        .assess(&manifest.retirements);
+    changes = pgroles_inspect::resolve_membership_options(pool, changes, &current).await?;
+    // The apply guards, shared with candidate previews so that a preview
+    // reports exactly what this apply would refuse.
+    //
+    // Adopt-mode ownership transfers are refused because the operator executes
+    // without a human reviewing the plan, so the CLI's flag-gated refusal
+    // applies here too — but only when SQL will actually run. Observe policies
+    // keep producing plans for review regardless.
+    //
+    // Planned default-privilege changes and PUBLIC revokes need owner
+    // authority the executor may lack; a PUBLIC revoke without it silently
+    // no-ops and the controller would flap. Only executing is blocked there.
+    // Producing and reviewing a plan needs no authority, and failing here
+    // instead would leave an operator with a Degraded policy and nothing to
+    // look at.
+    let guards = evaluate_execution_guards(
+        pool,
+        resource,
+        reconciliation_mode,
+        &changes,
+        &current,
+        &manifest.retirements,
+    )
+    .await?;
+    if let Some(refusal) = guards.owner_transfer_refusal() {
+        return Err(ReconcileError::OwnerTransferBlocked(refusal));
+    }
+    let drop_safety = guards.drop_safety;
     if !drop_safety.warnings.is_empty() {
         tracing::info!(warnings = %drop_safety.warnings, "role-drop cleanup warnings");
     }
@@ -1525,16 +1673,7 @@ async fn apply_under_lock(
             drop_safety.blockers.to_string(),
         ));
     }
-
-    // Planned default-privilege changes and PUBLIC revokes need owner
-    // authority the executor may lack; a PUBLIC revoke without it silently
-    // no-ops and the controller would flap.
-    //
-    // Only executing is blocked. Producing and reviewing a plan needs no
-    // authority, and failing here instead would leave an operator with a
-    // Degraded policy and nothing to look at.
-    let authority_issues =
-        pgroles_inspect::preflight_authority_issues(pool, &changes, &current).await?;
+    let authority_issues = guards.authority;
     let authority_block: Option<String> = if authority_issues.is_empty() {
         None
     } else {
@@ -1610,13 +1749,10 @@ async fn apply_under_lock(
 
         // Create a PostgresPolicyPlan resource for changes (if any).
         let mut plan_ref_name = None;
-        // Observe mode used to only ever *set* this reference. When drift went
-        // away out of band the pending plan stayed Pending and the reference
-        // stayed pointing at it, while the policy reported InSync beside it.
-        let previous_plan_ref = resource
-            .status
-            .as_ref()
-            .and_then(|status| status.current_plan_ref.clone());
+        // Observe mode used to only ever *set* the plan reference. When drift
+        // went away out of band the pending plan stayed Pending and the
+        // reference stayed pointing at it, while the policy reported InSync
+        // beside it.
         // Tracks a plan that someone approved even though this policy never
         // executes, so the pointless approval is reported rather than ignored.
         let mut ignored_approval_plan = None;
@@ -1634,6 +1770,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                crate::plan::PlanReuse::PendingOnly,
                 false,
             )
             .await?;
@@ -1720,11 +1857,11 @@ async fn apply_under_lock(
         })
         .await?;
 
-        // Retire the plan the cleared reference pointed at. Ordered after the
-        // status write so a crash in between leaves a Pending plan the next
-        // reconcile finds and clears again, never a reference to nothing.
+        // Retire the plans no drift left anything for. Ordered after the
+        // status write so a crash in between never leaves a reference to a
+        // retired plan.
         if !drift_detected {
-            supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+            retire_actionable_plans(ctx, resource).await;
         }
 
         info!(
@@ -1756,6 +1893,7 @@ async fn apply_under_lock(
                     &applied_password_source_versions,
                     ctx.plan_retention,
                     None,
+                    crate::plan::PlanReuse::AutoApproval,
                     true,
                 )
                 .await?;
@@ -1812,6 +1950,17 @@ async fn apply_under_lock(
                     .await;
                 }
 
+                // Publish the review reference while the blocked plan stays
+                // Pending. Approval is an execution decision, so missing
+                // authority must stop before recording AutoApproved.
+                if let Some(message) = &authority_block {
+                    update_status(ctx, resource, |status| {
+                        set_blocked_plan_ref(status, &plan_name);
+                    })
+                    .await?;
+                    return Err(ReconcileError::ExecutorAuthority(message.clone()));
+                }
+
                 crate::plan::mark_plan_approved(
                     &ctx.kube_client,
                     &plan,
@@ -1823,13 +1972,6 @@ async fn apply_under_lock(
                 // Re-fetch after approval status update.
                 let plan = plans_api.get(&plan_name).await?;
                 emit_plan_event(ctx, resource, &plan, PlanEventType::Approved).await;
-
-                // The plan exists and is reviewable; this is the point past
-                // which it would execute, so this is where missing authority
-                // stops it.
-                if let Some(message) = &authority_block {
-                    return Err(ReconcileError::ExecutorAuthority(message.clone()));
-                }
 
                 emit_plan_event(ctx, resource, &plan, PlanEventType::ApplyStarted).await;
 
@@ -1898,6 +2040,16 @@ async fn apply_under_lock(
                 info!(name, namespace, "no changes needed");
             }
 
+            // A plan published while executor authority was missing stays
+            // referenced and Pending; 0.13 left such plans Approved. With no
+            // changes left their effects are gone, so they are retired with no
+            // replacement, as in observe mode.
+            let stale_plan_ref = if changes.is_empty() {
+                referenced_actionable_plan(ctx, resource).await
+            } else {
+                None
+            };
+
             // The database now holds this content, however it got there — an
             // auto-approved apply, or nothing to do because it was already
             // converged. Either way a candidate proposing exactly this content
@@ -1925,8 +2077,17 @@ async fn apply_under_lock(
                 status.last_error = None;
                 status.applied_password_source_versions = applied_password_source_versions;
                 status.transient_failure_count = 0;
+                if stale_plan_ref.is_some() {
+                    status.current_plan_ref = None;
+                }
             })
             .await?;
+
+            // After the status write, as in observe mode: a crash in between
+            // never leaves a reference to a retired plan.
+            if changes.is_empty() {
+                retire_actionable_plans(ctx, resource).await;
+            }
 
             Ok((
                 Action::requeue(requeue_interval),
@@ -2126,6 +2287,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                crate::plan::PlanReuse::PendingOnly,
                                 false,
                             )
                             .await?;
@@ -2469,6 +2631,7 @@ async fn apply_under_lock(
                                 &applied_password_source_versions,
                                 ctx.plan_retention,
                                 None,
+                                crate::plan::PlanReuse::PendingOnly,
                                 false,
                             )
                             .await?;
@@ -2617,6 +2780,7 @@ async fn apply_under_lock(
                 &applied_password_source_versions,
                 ctx.plan_retention,
                 None,
+                crate::plan::PlanReuse::PendingOnly,
                 false,
             )
             .await?;
@@ -3100,6 +3264,7 @@ fn accumulate_summary(summary: &mut ChangeSummary, change: &pgroles_core::diff::
         Change::Revoke { .. } => summary.grants_revoked += 1,
         Change::SetDefaultPrivilege { .. } => summary.default_privileges_set += 1,
         Change::RevokeDefaultPrivilege { .. } => summary.default_privileges_revoked += 1,
+        Change::UpdateMemberOptions { .. } => summary.members_options_changed += 1,
         Change::AddMember { .. } => summary.members_added += 1,
         Change::RemoveMember { .. } => summary.members_removed += 1,
         Change::SetPassword { .. } => summary.passwords_set += 1,
@@ -3121,6 +3286,7 @@ pub(crate) fn summarize_changes(changes: &[pgroles_core::diff::Change]) -> Chang
         + summary.grants_revoked
         + summary.default_privileges_set
         + summary.default_privileges_revoked
+        + summary.members_options_changed
         + summary.members_added
         + summary.members_removed
         + summary.passwords_set;
@@ -3254,11 +3420,6 @@ async fn mark_reconciled_no_changes(
     plan_warnings: Vec<String>,
     applied_password_source_versions: std::collections::BTreeMap<String, String>,
 ) -> Result<(), ReconcileError> {
-    let previous_plan_ref = resource
-        .status
-        .as_ref()
-        .and_then(|status| status.current_plan_ref.clone());
-
     update_status(ctx, resource, |status| {
         status.set_condition(ready_condition(true, "Reconciled", "No changes needed"));
         status.set_condition(drifted_condition(false, "InSync", "No pending changes"));
@@ -3283,59 +3444,75 @@ async fn mark_reconciled_no_changes(
     })
     .await?;
 
-    // Only after the reference is gone: a crash here leaves a Pending plan
-    // that the next reconcile still finds, whereas superseding first and
-    // crashing would strand the reference on a plan nobody can act on.
-    supersede_referenced_plan_if_pending(ctx, resource, previous_plan_ref.as_ref()).await;
+    // Only after the reference is gone, so a crash in between never leaves a
+    // reference to a retired plan.
+    retire_actionable_plans(ctx, resource).await;
 
     Ok(())
 }
 
-/// Retire a plan a just-cleared `current_plan_ref` pointed at, if it is still
-/// Pending.
-///
-/// Best-effort by design: the reference is already gone, so a failure here
-/// costs a stale Pending plan that the next reconcile or plan retention
-/// collects — not a wedged reconcile.
-async fn supersede_referenced_plan_if_pending(
+/// The policy's referenced plan, when it is still Pending or Approved.
+async fn referenced_actionable_plan(
     ctx: &OperatorContext,
     resource: &PostgresPolicy,
-    plan_ref: Option<&crate::crd::PlanReference>,
-) {
-    let (Some(plan_ref), Some(namespace)) = (plan_ref, resource.namespace()) else {
-        return;
-    };
-
+) -> Option<crate::crd::PlanReference> {
+    let plan_ref = resource.status.as_ref()?.current_plan_ref.clone()?;
+    let namespace = resource.namespace()?;
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(ctx.kube_client.clone(), &namespace);
-    let plan = match plans_api.get_opt(&plan_ref.name).await {
-        Ok(Some(plan)) => plan,
-        Ok(None) => return,
+    match plans_api.get_opt(&plan_ref.name).await {
+        Ok(Some(plan))
+            if plan.status.as_ref().is_some_and(|s| {
+                matches!(
+                    s.phase,
+                    crate::crd::PlanPhase::Pending | crate::crd::PlanPhase::Approved
+                )
+            }) =>
+        {
+            Some(plan_ref)
+        }
+        Ok(_) => None,
         Err(err) => {
-            tracing::warn!(
-                plan = %plan_ref.name,
-                error = %err,
-                "could not read the plan a cleared reference pointed at"
-            );
+            tracing::warn!(plan = %plan_ref.name, error = %err, "could not read the referenced plan");
+            None
+        }
+    }
+}
+
+/// Retire every plan of the policy's own that is still Pending or Approved,
+/// once a reconcile has found nothing left to change.
+///
+/// Found by listing, not through `current_plan_ref`: the reference is cleared
+/// in the same pass, so a supersede that fails here is retried by the next
+/// converged reconcile instead of stranding a live plan nothing points at.
+/// Nothing else would collect it — retention never evicts a live plan — and
+/// the candidate gate counts any live plan as a decision still outstanding,
+/// so one stranded plan would hold every candidate at `AwaitingDecision`
+/// while the policy reports `InSync`. Approved plans are included: 0.13
+/// approved auto-apply plans it lacked the authority to run and left them
+/// behind.
+async fn retire_actionable_plans(ctx: &OperatorContext, resource: &PostgresPolicy) {
+    let plans = match crate::plan::actionable_policy_plans(&ctx.kube_client, resource).await {
+        Ok(plans) => plans,
+        Err(err) => {
+            tracing::warn!(error = %err, "could not list plans left with nothing to execute");
             return;
         }
     };
-
-    if plan.status.as_ref().map(|s| &s.phase) != Some(&crate::crd::PlanPhase::Pending) {
-        return;
-    }
-
-    if let Err(err) = crate::plan::mark_plan_superseded(
-        &ctx.kube_client,
-        &plan,
-        crate::plan::SupersedeCause::PolicyStoppedPlanning,
-    )
-    .await
-    {
-        tracing::warn!(
-            plan = %plan_ref.name,
-            error = %err,
-            "could not supersede the plan a cleared reference pointed at"
-        );
+    for plan in plans {
+        if let Err(err) = crate::plan::mark_plan_superseded(
+            &ctx.kube_client,
+            &plan,
+            crate::plan::SupersedeCause::PolicyStoppedPlanning,
+        )
+        .await
+        {
+            tracing::warn!(
+                plan = %plan.name_any(),
+                error = %err,
+                "could not retire a plan left with nothing to execute; the next converged \
+                 reconcile retries"
+            );
+        }
     }
 }
 
@@ -3397,13 +3574,9 @@ where
     apply_additive_absence_condition(&latest, &mut status);
     clear_stale_approval_ignored_condition(&latest, &mut status);
 
-    // A status write that changes nothing still bumps `resourceVersion`, and
-    // the resulting watch event re-triggers this controller immediately —
-    // discarding whatever back-off `error_policy` chose. That is not a
-    // theoretical cost: a permanently-failing policy reconciles, writes status,
-    // wakes itself, and spins as fast as it can reconcile (~5/second observed),
-    // taking the per-database advisory lock every time and starving every other
-    // policy pointed at the same database.
+    // Avoid redundant API writes and resourceVersion changes. The policy
+    // watch filters status-only updates; this does not imply a self-triggered
+    // reconcile loop, but no-op status patches still cost API requests.
     //
     // Compared as serialized JSON rather than with `PartialEq`: the question is
     // whether the PATCH body differs from what is stored, and that is exactly a
@@ -3600,6 +3773,8 @@ fn detect_policy_conflict_in_list(
 impl ReconcileError {
     fn reason(&self) -> &'static str {
         match self {
+            ReconcileError::MembershipPlanning(_) => "MembershipPlanningFailed",
+            ReconcileError::SqlRender(_) => "SqlRenderFailed",
             ReconcileError::ManifestExpansion(_)
             | ReconcileError::InvalidInterval(_, _)
             | ReconcileError::InvalidSpec(_) => "InvalidSpec",
@@ -3617,6 +3792,7 @@ impl ReconcileError {
             ReconcileError::ConflictingPolicy(_) => "ConflictingPolicy",
             ReconcileError::UnsatisfiableWildcardGrant(_) => "UnsatisfiableWildcardGrant",
             ReconcileError::ExecutorAuthority(_) => "ExecutorAuthority",
+            ReconcileError::PlanDenied(_) => "PlanDenied",
             ReconcileError::LockContention(_, _) => "LockContention",
             ReconcileError::RequestIndexNotReady(_) => "RequestIndexNotReady",
             ReconcileError::Context(context) => match context.as_ref() {
@@ -3705,47 +3881,32 @@ mod tests {
     }
 
     #[test]
-    fn adopt_owner_transfer_blocker_gates_on_flag_and_mode() {
-        let changes = vec![pgroles_core::diff::Change::AlterSchemaOwner {
-            name: "etl".to_string(),
-            owner: "pgloader_pg".to_string(),
-        }];
+    fn a_policy_executes_with_its_own_mode_and_transfer_allowance() {
+        let mut policy = (*test_policy("5m", 0)).clone();
+        let settings = execution_settings(&policy);
+        assert!(settings.executes);
+        assert!(!settings.allow_schema_owner_transfers);
+        assert!(
+            settings
+                .transfer_allowance
+                .contains("spec.allow_schema_owner_transfers")
+        );
+        policy.spec.allow_schema_owner_transfers = true;
+        assert!(execution_settings(&policy).allow_schema_owner_transfers);
+        policy.spec.mode = PolicyMode::Observe;
+        assert!(!execution_settings(&policy).executes);
+    }
 
-        // Adopt without the flag blocks, naming schemas and the spec field.
-        let blocker = adopt_owner_transfer_blocker(
-            pgroles_core::diff::ReconciliationMode::Adopt,
-            false,
-            &changes,
-        )
-        .expect("should block");
-        assert!(blocker.contains("etl"));
-        assert!(blocker.contains("allow_schema_owner_transfers"));
-
-        // The flag permits it; other modes never block.
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Adopt,
-                true,
-                &changes,
-            )
-            .is_none()
-        );
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Authoritative,
-                false,
-                &changes,
-            )
-            .is_none()
-        );
-        assert!(
-            adopt_owner_transfer_blocker(
-                pgroles_core::diff::ReconciliationMode::Adopt,
-                false,
-                &[],
-            )
-            .is_none()
-        );
+    #[test]
+    fn status_blockers_keep_the_guard_code_and_message() {
+        let blocker = status_blocker(pgroles_inspect::ExecutionBlocker {
+            guard: pgroles_inspect::ExecutionGuard::RoleDropSafety,
+            code: "UnsafeRoleDrop".into(),
+            message: "role owns objects".into(),
+        });
+        assert_eq!(blocker.guard, crate::crd::ExecutionGuard::RoleDropSafety);
+        assert_eq!(blocker.code, "UnsafeRoleDrop");
+        assert_eq!(blocker.message, "role owns objects");
     }
 
     #[test]
@@ -4453,13 +4614,24 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
+            // An option-only change runs SQL too, so it counts toward the total
+            // the status message, print column and metric all report.
+            Change::UpdateMemberOptions {
+                role: "reader".to_string(),
+                member: "app".to_string(),
+                grantor: "pgroles_executor".to_string(),
+                inherit: Some(true),
+                admin: None,
+                binding: None,
+            },
         ];
 
         let summary = summarize_changes(&changes);
         assert_eq!(summary.roles_created, 1);
         assert_eq!(summary.schemas_created, 1);
         assert_eq!(summary.grants_added, 1);
-        assert_eq!(summary.total, 3);
+        assert_eq!(summary.members_options_changed, 1);
+        assert_eq!(summary.total, 4);
     }
 
     #[test]
@@ -6139,5 +6311,249 @@ mod tests {
         // Should be within 2 seconds of now.
         let diff = now_secs.abs_diff(parsed.unwrap());
         assert!(diff <= 2, "parsed time should be close to now, diff={diff}");
+    }
+    #[test]
+    fn blocked_authority_retry_does_not_temporarily_change_failure_status() {
+        let mut status = PostgresPolicyStatus::default();
+        set_blocked_plan_ref(&mut status, "blocked-plan");
+        mark_reconcile_failure_status(
+            &mut status,
+            "ExecutorAuthority",
+            "grantor unavailable",
+            false,
+            false,
+        );
+        let stable = serde_json::to_value(&status).unwrap();
+        for _ in 0..3 {
+            set_blocked_plan_ref(&mut status, "blocked-plan");
+            assert_eq!(
+                serde_json::to_value(&status).unwrap(),
+                stable,
+                "publishing the same review reference must not create an intermediate status patch"
+            );
+            mark_reconcile_failure_status(
+                &mut status,
+                "ExecutorAuthority",
+                "grantor unavailable",
+                false,
+                false,
+            );
+            assert_eq!(serde_json::to_value(&status).unwrap(), stable);
+        }
+    }
+    #[test]
+    fn parent_failure_and_early_exit_paths_invalidate_candidate_eligibility() {
+        for outcome in [
+            ReconcileOutcome::Suspended,
+            ReconcileOutcome::Conflict,
+            ReconcileOutcome::TargetIdentityBlocked,
+        ] {
+            assert!(candidate_evaluation_unavailable(&Ok((
+                Action::await_change(),
+                outcome
+            ))));
+        }
+        for error in [
+            ReconcileError::SqlExec(sqlx::Error::PoolTimedOut),
+            ReconcileError::InvalidSpec("bad".into()),
+        ] {
+            assert!(candidate_evaluation_unavailable(&Err(error)));
+        }
+        for outcome in [ReconcileOutcome::Reconciled, ReconcileOutcome::Planned] {
+            assert!(!candidate_evaluation_unavailable(&Ok((
+                Action::await_change(),
+                outcome
+            ))));
+        }
+    }
+
+    #[test]
+    fn a_parent_refused_by_an_apply_guard_keeps_the_previews_it_just_evaluated() {
+        use crate::candidate::ParentOutcome;
+        for refusal in [
+            ReconcileError::ExecutorAuthority("blocked".into()),
+            ReconcileError::OwnerTransferBlocked("\"warehouse\" -> \"owner\"".into()),
+            ReconcileError::UnsafeRoleDrops("role owns objects".into()),
+        ] {
+            let blocked = Err(refusal);
+            assert_eq!(
+                candidate_parent_outcome(&blocked),
+                Some(ParentOutcome::ExecutionBlocked)
+            );
+            // The inner reconcile planned candidates against the unchanged
+            // database; the outer path must not withdraw those results.
+            assert!(!candidate_evaluation_unavailable(&blocked));
+        }
+        assert_eq!(
+            candidate_parent_outcome(&Ok((Action::await_change(), ReconcileOutcome::Suspended))),
+            Some(ParentOutcome::Unstable)
+        );
+        assert_eq!(
+            candidate_parent_outcome(&Err(ReconcileError::InvalidSpec("bad".into()))),
+            None
+        );
+    }
+
+    #[test]
+    fn lock_contention_does_not_withdraw_a_stamped_preview() {
+        assert!(!candidate_evaluation_unavailable(&Ok((
+            Action::await_change(),
+            ReconcileOutcome::LockContention
+        ))));
+        assert!(!candidate_evaluation_unavailable(&Err(
+            ReconcileError::LockContention("db".into(), "busy".into())
+        )));
+    }
+    /// Uses only the disposable DATABASE_URL fixture, with unique names. The
+    /// same retained DROP is checked on two targets without executing cleanup.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL instance with CREATEDB/CREATEROLE"]
+    async fn live_drop_guards_use_target_and_retirements_without_mutating() {
+        use futures::FutureExt;
+        use pgroles_core::{
+            diff::{Change, ReconciliationMode},
+            manifest::RoleRetirement,
+        };
+        use sqlx::{
+            Connection, Executor,
+            postgres::{PgConnectOptions, PgPoolOptions},
+        };
+        use std::{panic::AssertUnwindSafe, str::FromStr};
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for disposable test fixture");
+        let options = PgConnectOptions::from_str(&url).unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone())
+            .await
+            .unwrap();
+        let policy = test_policy("5m", 0);
+        let suffix = rand::random::<u64>();
+        let role = format!("guard_retired_{suffix}");
+        let space = format!("guard_space_{suffix}");
+        let other_database = format!("guard_target_{suffix}");
+        // Keep cleanup outside the assertion future so panic unwinding also
+        // releases sessions and removes only this fixture's unique objects.
+        let result = AssertUnwindSafe(async {
+            pool.execute(format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'").as_str())
+                .await
+                .unwrap();
+            pool.execute(format!("CREATE SCHEMA {space} AUTHORIZATION {role}").as_str())
+                .await
+                .unwrap();
+            pool.execute(format!("CREATE DATABASE {other_database}").as_str())
+                .await
+                .unwrap();
+            let other_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(options.clone().database(&other_database))
+                .await
+                .unwrap();
+            let mut session = sqlx::PgConnection::connect_with(
+                &options.username(&role).password("fixture-password"),
+            )
+            .await
+            .unwrap();
+            session
+                .execute(format!("CREATE TABLE {space}.records (id int)").as_str())
+                .await
+                .unwrap();
+            let changes = vec![Change::DropRole { name: role.clone() }];
+            let retirements = vec![RoleRetirement {
+                role: role.clone(),
+                reassign_owned_to: Some("postgres".into()),
+                drop_owned: true,
+                terminate_sessions: true,
+            }];
+            let uncovered = evaluate_execution_guards(
+                &pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &[],
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(uncovered.has_blockers());
+            let local = evaluate_execution_guards(
+                &pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &retirements,
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(!local.has_blockers(), "{}", local.blockers);
+            assert!(!local.warnings.is_empty());
+            let external = evaluate_execution_guards(
+                &other_pool,
+                &policy,
+                ReconciliationMode::Authoritative,
+                &changes,
+                &Default::default(),
+                &retirements,
+            )
+            .await
+            .unwrap()
+            .drop_safety;
+            assert!(
+                external.has_blockers(),
+                "another database's dependencies remain blocked"
+            );
+            assert!(
+                external
+                    .blockers
+                    .issues
+                    .iter()
+                    .any(|issue| issue.external_owned_object_count > 0)
+            );
+            assert!(external.blockers.issues.iter().any(|issue| {
+                issue
+                    .external_owned_object_examples
+                    .iter()
+                    .any(|example| example.contains("catalog "))
+            }));
+            // Cleanup coverage is advice: preview must neither terminate this
+            // session nor reassign/drop the objects or the role.
+            let owner: String = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = $1::regclass",
+            )
+            .bind(format!("{space}.records"))
+            .fetch_one(&mut session)
+            .await
+            .unwrap();
+            assert_eq!(owner, role);
+            let who: String = sqlx::query_scalar("SELECT current_user::text")
+                .fetch_one(&mut session)
+                .await
+                .unwrap();
+            assert_eq!(who, role);
+            session.close().await.unwrap();
+            other_pool.close().await;
+        })
+        .catch_unwind()
+        .await;
+        let mut cleanup_errors = Vec::new();
+        for statement in [
+            format!("DROP DATABASE IF EXISTS {other_database} WITH (FORCE)"),
+            format!("DROP SCHEMA IF EXISTS {space} CASCADE"),
+            format!("DROP ROLE IF EXISTS {role}"),
+        ] {
+            if let Err(error) = pool.execute(statement.as_str()).await {
+                cleanup_errors.push(error.to_string());
+            }
+        }
+        pool.close().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            cleanup_errors.is_empty(),
+            "fixture cleanup: {cleanup_errors:?}"
+        );
     }
 }

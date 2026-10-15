@@ -125,6 +125,24 @@ pub enum Change {
         admin: bool,
     },
 
+    /// Change options on one PG16+ attribution, preserving independent edges.
+    /// Existing tuples retain omitted options; a bound absent tuple contributes
+    /// only required positive options with SET FALSE. Reductions target every
+    /// supplying edge with dependency-aware option revocation.
+    UpdateMemberOptions {
+        role: String,
+        member: String,
+        grantor: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        inherit: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admin: Option<bool>,
+        /// Fresh executor and exact per-grantor tuple expectations, resolved
+        /// before SQL generation and approval hashing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<crate::membership_options::MembershipOptionBinding>,
+    },
+
     /// Revoke membership (REVOKE role FROM member).
     ///
     /// `grantor` targets the specific membership edge to remove. Since
@@ -239,6 +257,30 @@ pub fn filter_changes(changes: Vec<Change>, mode: ReconciliationMode) -> Vec<Cha
     }
 }
 
+/// The schema ownership transfers an adopt-mode plan makes, as `(schema, new owner)`.
+///
+/// Adopt filters role drops, not ownership convergence: a binding whose
+/// declared owner differs from the live one is still transferred, which has
+/// surprised adopters whose schemas another system owned. Apply refuses these
+/// unless they were explicitly allowed. Every surface that applies or previews
+/// a plan reads the rule from here, so a preview cannot pass what the apply it
+/// predicts would refuse.
+pub fn adopt_schema_owner_transfers(
+    mode: ReconciliationMode,
+    changes: &[Change],
+) -> Vec<(&str, &str)> {
+    if mode != ReconciliationMode::Adopt {
+        return Vec::new();
+    }
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::AlterSchemaOwner { name, owner } => Some((name.as_str(), owner.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Whether additive reconciliation will ignore declarative absence assertions.
 ///
 /// The desired graph retains absence assertions — `ensure: absent` grants and
@@ -313,7 +355,8 @@ pub fn filter_external_role_changes(
             | Change::ReassignOwned {
                 from_role: role, ..
             } => !unmanaged(role),
-            Change::AddMember { role, member, .. } => {
+            Change::AddMember { role, member, .. }
+            | Change::UpdateMemberOptions { role, member, .. } => {
                 !unmanaged(role) || declared_edges.contains(&(role.as_str(), member.as_str()))
             }
             Change::RemoveMember { role, member, .. } => {
@@ -546,6 +589,20 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
 
     changes
         .into_iter()
+        .filter_map(|mut change| {
+            if let Change::UpdateMemberOptions { inherit, admin, .. } = &mut change {
+                if *inherit == Some(false) {
+                    *inherit = None;
+                }
+                if *admin == Some(false) {
+                    *admin = None;
+                }
+                if inherit.is_none() && admin.is_none() {
+                    return None;
+                }
+            }
+            Some(change)
+        })
         .filter(|change| match change {
             Change::EnsureSchemaOwnerPrivileges { name, owner, .. } => {
                 !skipped_owner_transfers.contains(&(name.clone(), owner.clone()))
@@ -570,6 +627,15 @@ fn filter_additive_changes(changes: Vec<Change>) -> Vec<Change> {
 /// Returns `true` for any change that removes access or drops a role.
 fn is_destructive(change: &Change) -> bool {
     matches!(
+        change,
+        Change::UpdateMemberOptions {
+            inherit: Some(false),
+            ..
+        } | Change::UpdateMemberOptions {
+            admin: Some(false),
+            ..
+        }
+    ) || matches!(
         change,
         Change::AlterSchemaOwner { .. }
             | Change::Revoke { .. }
@@ -1405,7 +1471,8 @@ fn diff_memberships(
     remove_out: &mut Vec<Change>,
 ) {
     // We compare memberships by (role, member) as the key.
-    // If inherit/admin flags changed, we remove and re-add.
+    // PG16+ catalog facts permit grantor-aware in-place option changes.
+    // Callers without those facts retain the legacy remove/re-add behavior.
 
     // Build lookup maps: (role, member) → MembershipEdge
     let current_map: std::collections::BTreeMap<(&str, &str), &MembershipEdge> = current
@@ -1445,7 +1512,7 @@ fn diff_memberships(
     };
 
     // Desired but not current → add
-    // Desired and current but different flags → remove + add
+    // Desired and current but different flags → attributed option intents
     for (&(role, member), &desired_edge) in &desired_map {
         match current_map.get(&(role, member)) {
             None => {
@@ -1460,7 +1527,54 @@ fn diff_memberships(
                 if current_edge.inherit != desired_edge.inherit
                     || current_edge.admin != desired_edge.admin
                 {
-                    // Flags changed — revoke every edge and re-grant one.
+                    let key = (role.to_string(), member.to_string());
+                    if let Some(grantors) = current.membership_edge_grantors.get(&key)
+                        && !grantors.is_empty()
+                    {
+                        let options = current.membership_edge_options.get(&key);
+                        // Split positive and negative option deltas before
+                        // additive filtering. Reductions touch every supplier;
+                        // the positive intent is resolved to a proven usable
+                        // attribution before producing executable SQL.
+                        for grantor in grantors {
+                            let live = options.and_then(|edges| edges.get(grantor));
+                            let inherit = (current_edge.inherit
+                                && !desired_edge.inherit
+                                && live.is_none_or(|edge| edge.inherit))
+                            .then_some(false);
+                            let admin = (current_edge.admin
+                                && !desired_edge.admin
+                                && live.is_none_or(|edge| edge.admin))
+                            .then_some(false);
+                            if inherit.is_some() || admin.is_some() {
+                                remove_out.push(Change::UpdateMemberOptions {
+                                    role: role.to_string(),
+                                    member: member.to_string(),
+                                    grantor: grantor.clone(),
+                                    inherit,
+                                    admin,
+                                    binding: None,
+                                });
+                            }
+                        }
+                        let inherit =
+                            (!current_edge.inherit && desired_edge.inherit).then_some(true);
+                        let admin = (!current_edge.admin && desired_edge.admin).then_some(true);
+                        if inherit.is_some() || admin.is_some() {
+                            add_out.push(Change::UpdateMemberOptions {
+                                role: role.to_string(),
+                                member: member.to_string(),
+                                // Placeholder only: resolution never treats its
+                                // alphabetical position as authority evidence.
+                                grantor: grantors.first().expect("nonempty").clone(),
+                                inherit,
+                                admin,
+                                binding: None,
+                            });
+                        }
+                        continue;
+                    }
+                    // No grantor attribution (legacy inspection): retain its path.
                     remove_all_edges(role, member, remove_out);
                     add_out.push(Change::AddMember {
                         role: desired_edge.role.clone(),
@@ -1684,7 +1798,7 @@ memberships:
 
         // Fresh database: everything is created, including config statements.
         let changes = diff(&empty_graph(), &desired);
-        let sql = crate::sql::render_all(&changes);
+        let sql = crate::sql::render_all(&changes).unwrap();
         assert!(sql.contains("ALTER ROLE \"blue\" SET \"role\" = 'combined';"));
         assert!(sql.contains("ALTER ROLE \"green\" SET \"role\" = 'combined';"));
         assert!(sql.contains("GRANT \"combined\" TO \"blue\""));
@@ -1703,7 +1817,7 @@ memberships:
             .config
             .insert("statement_timeout".to_string(), "10s".to_string());
         let changes = diff(&current, &desired);
-        let sql = crate::sql::render_all(&changes);
+        let sql = crate::sql::render_all(&changes).unwrap();
         assert!(sql.contains("ALTER ROLE \"green\" SET \"role\" = 'combined';"));
         assert!(sql.contains("ALTER ROLE \"blue\" RESET \"statement_timeout\";"));
         assert!(!sql.contains("ALTER ROLE \"blue\" SET"));
@@ -3191,6 +3305,31 @@ memberships:
         ];
         let filtered = filter_changes(changes, ReconciliationMode::Additive);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn only_adopt_mode_reports_schema_owner_transfers() {
+        let changes = vec![
+            Change::CreateSchema {
+                name: "fresh".into(),
+                owner: Some("app".into()),
+            },
+            Change::AlterSchemaOwner {
+                name: "warehouse".into(),
+                owner: "warehouse_owner".into(),
+            },
+        ];
+        assert_eq!(
+            adopt_schema_owner_transfers(ReconciliationMode::Adopt, &changes),
+            vec![("warehouse", "warehouse_owner")],
+            "a created schema has no previous owner to transfer from"
+        );
+        for mode in [
+            ReconciliationMode::Authoritative,
+            ReconciliationMode::Additive,
+        ] {
+            assert!(adopt_schema_owner_transfers(mode, &changes).is_empty());
+        }
     }
 
     #[test]

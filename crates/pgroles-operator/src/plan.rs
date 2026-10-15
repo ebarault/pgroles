@@ -50,9 +50,10 @@ pub fn password_source_changed(
 pub enum PlanCreationResult {
     /// A new plan was created with the given name.
     Created(String),
-    /// An existing pending plan with the same effects was found
-    /// (deduplication). The returned plan is actionable: it is awaiting a
-    /// decision and holds exactly the effects just computed.
+    /// An existing actionable plan with the same effects was found
+    /// (deduplication). It holds exactly the effects just computed. It is
+    /// Pending — awaiting a decision — unless the caller allowed auto-approved
+    /// reuse, in which case it may already be Approved.
     Deduplicated(String),
     /// A plan holding exactly these effects failed recently and is still
     /// inside its retry window, so no new plan was opened. The returned plan
@@ -399,6 +400,9 @@ pub enum SupersedeCause {
     EffectsCleared,
     /// A newer plan holds the current effects; this one is redundant.
     ReplacedByNewerPlan,
+    /// Another actionable plan holds exactly these effects against the same
+    /// base and is the one the policy acts on; this copy can never execute.
+    DuplicateOfActionablePlan,
     /// The database the plan was computed against is not the one it would now
     /// execute against. Carries the specific target-identity verdict.
     TargetChanged(pgroles_core::approval::TargetIdentityReason),
@@ -454,6 +458,10 @@ impl SupersedeCause {
             }
             SupersedeCause::ReplacedByNewerPlan => {
                 "a newer plan holds the current effects and replaces this one"
+            }
+            SupersedeCause::DuplicateOfActionablePlan => {
+                "another actionable plan holds identical effects and is the one this policy \
+                 acts on, so this duplicate will never execute"
             }
             SupersedeCause::TargetChanged(reason) => reason.message(),
             SupersedeCause::PolicyStoppedPlanning => {
@@ -637,7 +645,7 @@ fn plan_base_pin(plan: &PostgresPolicyPlan) -> Option<&str> {
 /// This function:
 /// 1. Renders the full executable SQL from the changes
 /// 2. Computes SHA-256 of the full SQL (before any redaction/truncation)
-/// 3. Checks for an existing Pending plan with the same hash (dedup)
+/// 3. Checks for an existing Pending or Approved plan with the same hash (dedup)
 /// 4. Persists the SQL preview artifact, if needed
 /// 5. Creates the new plan resource with ownerReferences
 /// 6. Updates the plan status
@@ -656,6 +664,7 @@ pub async fn create_or_update_plan(
     password_source_versions: &BTreeMap<String, String>,
     plan_retention: PlanRetention,
     candidate: Option<CandidatePlanBinding<'_>>,
+    reuse: PlanReuse,
     detect_nonconvergent_apply: bool,
 ) -> Result<PlanCreationResult, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
@@ -685,7 +694,7 @@ pub async fn create_or_update_plan(
     //    artifact only — never an execution payload, and never the approval
     //    identity.
     let render_started = std::time::Instant::now();
-    let full_sql = render_full_sql(changes, sql_context);
+    let full_sql = render_full_sql(changes, sql_context)?;
 
     // 2. Compute the approval identity: a canonical digest of the typed
     //    effects. Deduplication and approval both key off this rather than the
@@ -708,7 +717,7 @@ pub async fn create_or_update_plan(
     let sql_statement_count = full_sql.lines().filter(|l| !l.trim().is_empty()).count() as i64;
 
     // 5. Render redacted SQL for display (passwords masked).
-    let redacted_sql = render_redacted_sql(changes, sql_context);
+    let redacted_sql = render_redacted_sql(changes, sql_context)?;
     tracing::debug!(
         phase = "plan_render",
         elapsed_ms = render_started.elapsed().as_secs_f64() * 1000.0,
@@ -738,35 +747,37 @@ pub async fn create_or_update_plan(
         .filter(|plan| owner.owns(plan))
         .collect();
 
-    // 5. Check for duplicate pending plan with the same effects.
-    for plan in &existing_plans {
-        if let Some(ref status) = plan.status
-            && status.phase == PlanPhase::Pending
-            && plan_matches_digest(status, &change_digest)
-            && expected_base.is_none_or(|base| plan_base_pin(plan) == Some(base))
-        {
-            // Identical plan already exists — return early (deduplicated).
-            let plan_name = plan.name_any();
-            info!(
-                plan = %plan_name,
-                policy = %policy_name,
-                "existing pending plan has identical change digest, skipping creation"
-            );
-            // This pending plan *is* the replacement: it is already visible and
-            // holds exactly these effects, so any stale approved plan can be
-            // retired now without leaving the policy with nothing actionable.
-            supersede_stale_plans(
-                &plans_api,
-                &existing_plans,
-                &policy_name,
-                &plan_name,
-                &change_digest,
-                expected_base,
-                password_source_versions,
-            )
-            .await?;
-            return Ok(PlanCreationResult::Deduplicated(plan_name));
-        }
+    // 5. Reuse an actionable plan that already holds these exact effects.
+    //
+    // Under auto-approval Approved plans count too. The plan watch wakes the
+    // policy whenever a plan's phase changes, so a reconcile that approved a
+    // plan and then stopped short of executing it (missing executor authority,
+    // say) used to find no Pending match on the next pass, mint an identical
+    // plan, approve it, and wake itself again: a new plan every few seconds for
+    // as long as the blocker lasted.
+    if let Some(plan) = reusable_plan(&existing_plans, &change_digest, expected_base, reuse) {
+        let plan_name = plan.name_any();
+        info!(
+            plan = %plan_name,
+            policy = %policy_name,
+            "existing actionable plan has identical change digest, skipping creation"
+        );
+        // This actionable plan *is* the replacement: it is already visible and
+        // holds exactly these effects, so stale plans — and identical
+        // duplicates left by earlier controllers — can be retired now without
+        // leaving the policy with nothing actionable.
+        supersede_stale_plans(
+            &plans_api,
+            &existing_plans,
+            &policy_name,
+            &plan_name,
+            &change_digest,
+            expected_base,
+            password_source_versions,
+            reuse,
+        )
+        .await?;
+        return Ok(PlanCreationResult::Deduplicated(plan_name));
     }
 
     // 5b. Check for a recently-failed plan with the same change digest. If a
@@ -1036,6 +1047,7 @@ pub async fn create_or_update_plan(
         &change_digest,
         expected_base,
         password_source_versions,
+        reuse,
     )
     .await?;
 
@@ -1066,11 +1078,119 @@ pub(crate) fn supersedes_after_create(status: &PostgresPolicyPlanStatus, new_dig
     }
 }
 
+/// Which existing plans a reconcile may adopt instead of creating one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanReuse {
+    /// Only Pending plans, which are still awaiting a decision. A human
+    /// decision is never inherited by a different review path, and a plan the
+    /// caller is replacing is never handed back to it.
+    PendingOnly,
+    /// Pending plans, and Approved ones: `approval: auto`, where the operator
+    /// is the decider and an approved-but-unexecuted plan (blocked on executor
+    /// authority, say) is exactly the plan to retry. Identical duplicates left
+    /// behind by earlier controllers are retired, and denied plans rejected.
+    AutoApproval,
+}
+
+/// Whether a reviewer recorded `Denied=True` on this plan.
+fn is_denied(status: &PostgresPolicyPlanStatus) -> bool {
+    status
+        .conditions
+        .iter()
+        .any(|c| c.condition_type == "Denied" && c.status == "True")
+}
+
+/// The actionable plan that already holds `change_digest`, if any.
+///
+/// A plan carrying a Denied decision is never reused, whatever its phase. Under
+/// [`PlanReuse::AutoApproval`] several copies can exist when an older
+/// controller minted duplicates; an approved plan wins over a pending one, then
+/// the newest — the plan [`get_current_actionable_plan`] reports — then the
+/// name, so the choice never depends on list order.
+fn reusable_plan<'a>(
+    plans: &'a [PostgresPolicyPlan],
+    change_digest: &str,
+    expected_base: Option<&str>,
+    reuse: PlanReuse,
+) -> Option<&'a PostgresPolicyPlan> {
+    let reusable_phase = |phase: &PlanPhase| match reuse {
+        PlanReuse::PendingOnly => *phase == PlanPhase::Pending,
+        PlanReuse::AutoApproval => matches!(phase, PlanPhase::Pending | PlanPhase::Approved),
+    };
+    plans
+        .iter()
+        .filter(|plan| {
+            plan.status.as_ref().is_some_and(|status| {
+                reusable_phase(&status.phase)
+                    && !is_denied(status)
+                    && plan_matches_digest(status, change_digest)
+            }) && expected_base.is_none_or(|base| plan_base_pin(plan) == Some(base))
+        })
+        .max_by(|a, b| {
+            let approved = |plan: &PostgresPolicyPlan| {
+                plan.status
+                    .as_ref()
+                    .is_some_and(|status| status.phase == PlanPhase::Approved)
+            };
+            (
+                approved(a),
+                &a.metadata.creation_timestamp,
+                &a.metadata.name,
+            )
+                .cmp(&(
+                    approved(b),
+                    &b.metadata.creation_timestamp,
+                    &b.metadata.name,
+                ))
+        })
+}
+
+/// Why `status` is retired now that `kept_plan_name` holds `new_digest`, if it
+/// is. `status` belongs to `plan`.
+fn supersede_cause(
+    plan: &PostgresPolicyPlan,
+    status: &PostgresPolicyPlanStatus,
+    kept_plan_name: &str,
+    new_digest: &str,
+    expected_base: Option<&str>,
+    password_source_versions: &BTreeMap<String, String>,
+    reuse: PlanReuse,
+) -> Option<SupersedeCause> {
+    if plan.name_any() == kept_plan_name {
+        return None;
+    }
+    let actionable = matches!(status.phase, PlanPhase::Pending | PlanPhase::Approved);
+    // A live plan pinned to a different base is stale even when its change
+    // digest still matches — see the base precondition in
+    // `create_or_update_plan`.
+    if actionable && expected_base.is_some_and(|base| plan_base_pin(plan) != Some(base)) {
+        return Some(SupersedeCause::BaseContentChanged);
+    }
+    // Same effects, same base, under auto-approval: the kept plan already
+    // carries them, and leaving the copy actionable would only let a later
+    // pass pick it instead. Other modes keep the earlier rules, where an
+    // approval that still describes the current effects is never discarded.
+    if reuse == PlanReuse::AutoApproval && actionable && plan_matches_digest(status, new_digest) {
+        return Some(SupersedeCause::DuplicateOfActionablePlan);
+    }
+    if !supersedes_after_create(status, new_digest) {
+        return None;
+    }
+    Some(
+        if password_source_changed(status, password_source_versions) {
+            SupersedeCause::PasswordSourceChanged
+        } else {
+            SupersedeCause::ReplacedByNewerPlan
+        },
+    )
+}
+
 /// Retire the plans replaced by `new_plan_name`.
 ///
 /// Called only once the replacement plan is visible with its status written —
 /// crash safety for the whole plan pointer rests on that ordering, so callers
 /// must never supersede ahead of creating.
+#[allow(clippy::too_many_arguments)]
 async fn supersede_stale_plans(
     plans_api: &Api<PostgresPolicyPlan>,
     existing_plans: &[PostgresPolicyPlan],
@@ -1079,49 +1199,67 @@ async fn supersede_stale_plans(
     new_digest: &str,
     expected_base: Option<&str>,
     password_source_versions: &BTreeMap<String, String>,
+    reuse: PlanReuse,
 ) -> Result<(), ReconcileError> {
     for plan in existing_plans {
-        let Some(ref status) = plan.status else {
+        let Some(status) = plan.status.as_ref() else {
             continue;
         };
         let old_plan_name = plan.name_any();
-        // A live plan pinned to a different base is stale even when its
-        // change digest still matches — see the base precondition in
-        // `create_or_update_plan`.
-        let base_stale = expected_base.is_some_and(|base| {
-            matches!(status.phase, PlanPhase::Pending | PlanPhase::Approved)
-                && plan_base_pin(plan) != Some(base)
-        });
-        if old_plan_name == new_plan_name
-            || (!supersedes_after_create(status, new_digest) && !base_stale)
+
+        // Under auto-approval nothing else reads a reviewer's decision on a
+        // Pending plan, so record the denial here rather than leave the plan
+        // Pending — and never reusable — forever.
+        if reuse == PlanReuse::AutoApproval
+            && status.phase == PlanPhase::Pending
+            && is_denied(status)
         {
+            if let Err(err) = mark_plan_rejected_with(plans_api, &old_plan_name).await {
+                tracing::warn!(plan = %old_plan_name, %err, "could not mark a denied plan Rejected");
+            }
             continue;
         }
-        let cause = if base_stale {
-            SupersedeCause::BaseContentChanged
-        } else if password_source_changed(status, password_source_versions) {
-            SupersedeCause::PasswordSourceChanged
-        } else {
-            SupersedeCause::ReplacedByNewerPlan
+
+        let Some(cause) = supersede_cause(
+            plan,
+            status,
+            new_plan_name,
+            new_digest,
+            expected_base,
+            password_source_versions,
+            reuse,
+        ) else {
+            continue;
         };
 
         info!(
             plan = %old_plan_name,
             policy = %policy_name,
             phase = ?status.phase,
+            reason = cause.reason(),
             "marking existing plan as Superseded"
         );
         // The plan is void along with its phase — but the decision on it is
         // terminal and write-once, so the record of who approved what is left
         // untouched. See `superseded_status`.
         let patch = serde_json::json!({ "status": superseded_status(status, cause) });
-        plans_api
+        let result = plans_api
             .patch_status(
                 &old_plan_name,
                 &PatchParams::apply("pgroles-operator"),
                 &Patch::Merge(&patch),
             )
-            .await?;
+            .await;
+        match result {
+            Ok(_) => {}
+            // A duplicate cannot execute while the kept plan is the one acted
+            // on, so failing to retire one (deleted meanwhile, say) must not
+            // fail the reconcile; the next pass retries.
+            Err(err) if cause == SupersedeCause::DuplicateOfActionablePlan => {
+                tracing::warn!(plan = %old_plan_name, %err, "could not retire a duplicate plan");
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
 
     Ok(())
@@ -1589,7 +1727,7 @@ pub(crate) async fn execute_changes_in_transaction(
     let mut transaction = pool.begin().await?;
     let mut statements_executed = 0usize;
 
-    for statement in pgroles_core::sql::render_batch_with_context(changes, sql_context) {
+    for statement in pgroles_core::sql::render_batch_with_context(changes, sql_context)? {
         tracing::debug!(sql = %statement.redacted_sql, "executing");
         sqlx::query(&statement.sql)
             .execute(transaction.as_mut())
@@ -1989,7 +2127,7 @@ async fn delete_configmap_best_effort(client: &Client, namespace: &str, configma
 pub(crate) fn render_full_sql(
     changes: &[pgroles_core::diff::Change],
     sql_context: &pgroles_core::sql::SqlContext,
-) -> String {
+) -> Result<String, pgroles_core::sql::SqlRenderError> {
     pgroles_core::sql::render_all_with_context(changes, sql_context)
 }
 
@@ -1997,12 +2135,14 @@ pub(crate) fn render_full_sql(
 fn render_redacted_sql(
     changes: &[pgroles_core::diff::Change],
     sql_context: &pgroles_core::sql::SqlContext,
-) -> String {
-    pgroles_core::sql::render_batch_with_context(changes, sql_context)
-        .into_iter()
-        .map(|statement| statement.redacted_sql)
-        .collect::<Vec<_>>()
-        .join("\n")
+) -> Result<String, pgroles_core::sql::SqlRenderError> {
+    Ok(
+        pgroles_core::sql::render_batch_with_context(changes, sql_context)?
+            .into_iter()
+            .map(|statement| statement.redacted_sql)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Compute the canonical approval-effect digest for a set of changes.
@@ -2333,36 +2473,46 @@ pub async fn get_current_actionable_plan(
     client: &Client,
     policy: &PostgresPolicy,
 ) -> Result<Option<PostgresPolicyPlan>, ReconcileError> {
+    Ok(actionable_policy_plans(client, policy)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// The policy's own plans that are still Pending or Approved, newest first.
+///
+/// Found by label and controller owner rather than through
+/// `status.current_plan_ref`, so a plan the reference no longer names is
+/// still found. Candidate-origin plans are owned by their candidate and are
+/// not included.
+pub async fn actionable_policy_plans(
+    client: &Client,
+    policy: &PostgresPolicy,
+) -> Result<Vec<PostgresPolicyPlan>, ReconcileError> {
     let namespace = policy.namespace().ok_or(ReconcileError::NoNamespace)?;
     let policy_name = policy.name_any();
 
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
     let selector = policy_selector(&policy_name);
-    let existing_plans: Vec<PostgresPolicyPlan> = plans_api
+    let mut actionable: Vec<PostgresPolicyPlan> = plans_api
         .list(&ListParams::default().labels_from(&selector))
         .await?
         .into_iter()
         .filter(|plan| is_owned_by_policy(plan, policy))
-        .collect();
-
-    // Find the most recent actionable plan (Pending or Approved, by creation time).
-    let mut pending_plans: Vec<PostgresPolicyPlan> = existing_plans
-        .into_iter()
         .filter(|plan| {
             plan.status
                 .as_ref()
-                .map(|s| matches!(s.phase, PlanPhase::Pending | PlanPhase::Approved))
-                .unwrap_or(false)
+                .is_some_and(|s| matches!(s.phase, PlanPhase::Pending | PlanPhase::Approved))
         })
         .collect();
 
-    pending_plans.sort_by(|a, b| {
+    actionable.sort_by(|a, b| {
         let a_time = a.metadata.creation_timestamp.as_ref();
         let b_time = b.metadata.creation_timestamp.as_ref();
         b_time.cmp(&a_time) // newest first
     });
 
-    Ok(pending_plans.into_iter().next())
+    Ok(actionable)
 }
 
 /// Look up the most recent plan for a policy in a given phase.
@@ -2457,6 +2607,11 @@ pub async fn mark_plan_approved(
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
 
     let existing = plan.status.clone().unwrap_or_default();
+    // A terminal decision is write-once, and a denial must never be carried
+    // into the Approved phase that execution keys on.
+    if is_denied(&existing) {
+        return Err(ReconcileError::PlanDenied(plan_name));
+    }
     if has_terminal_decision(&existing) {
         let patch = serde_json::json!({ "status": { "phase": PlanPhase::Approved } });
         plans_api
@@ -2501,9 +2656,14 @@ pub async fn mark_plan_rejected(
     plan: &PostgresPolicyPlan,
 ) -> Result<(), ReconcileError> {
     let namespace = plan.namespace().ok_or(ReconcileError::NoNamespace)?;
-    let plan_name = plan.name_any();
     let plans_api: Api<PostgresPolicyPlan> = Api::namespaced(client.clone(), &namespace);
+    mark_plan_rejected_with(&plans_api, &plan.name_any()).await
+}
 
+async fn mark_plan_rejected_with(
+    plans_api: &Api<PostgresPolicyPlan>,
+    plan_name: &str,
+) -> Result<(), ReconcileError> {
     // Patch the phase alone. The reviewer's `Denied=True` is the decision and
     // is terminal, so there is nothing here for the operator to add to the
     // conditions — and resending the whole array from a watch-backed read
@@ -2511,7 +2671,7 @@ pub async fn mark_plan_rejected(
     let patch = serde_json::json!({ "status": { "phase": PlanPhase::Rejected } });
     plans_api
         .patch_status(
-            &plan_name,
+            plan_name,
             &PatchParams::apply("pgroles-operator"),
             &Patch::Merge(&patch),
         )
@@ -3847,6 +4007,7 @@ mod tests {
             SupersedeCause::PasswordSourceChanged,
             SupersedeCause::EffectsCleared,
             SupersedeCause::ReplacedByNewerPlan,
+            SupersedeCause::DuplicateOfActionablePlan,
             SupersedeCause::PolicyStoppedPlanning,
             SupersedeCause::SupersededByPromotion,
             SupersedeCause::BaseContentChanged,
@@ -3860,6 +4021,7 @@ mod tests {
                 | SupersedeCause::PasswordSourceChanged
                 | SupersedeCause::EffectsCleared
                 | SupersedeCause::ReplacedByNewerPlan
+                | SupersedeCause::DuplicateOfActionablePlan
                 | SupersedeCause::PolicyStoppedPlanning
                 | SupersedeCause::SupersededByPromotion
                 | SupersedeCause::BaseContentChanged
@@ -4599,8 +4761,8 @@ mod tests {
         );
         let changes = vec![revoke("a"), revoke("b")];
         assert_eq!(
-            render_full_sql(&changes, &ctx),
-            render_redacted_sql(&changes, &ctx)
+            render_full_sql(&changes, &ctx).unwrap(),
+            render_redacted_sql(&changes, &ctx).unwrap()
         );
         assert_eq!(
             execute_changes_in_transaction(&pool, &changes, &ctx)
@@ -4642,7 +4804,7 @@ mod tests {
             },
         ];
         let ctx = pgroles_core::sql::SqlContext::default();
-        let redacted = render_redacted_sql(&changes, &ctx);
+        let redacted = render_redacted_sql(&changes, &ctx).unwrap();
 
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("super_secret"));
@@ -4658,7 +4820,7 @@ mod tests {
             password: "my_secret_pw".to_string(),
         }];
         let ctx = pgroles_core::sql::SqlContext::default();
-        let redacted = render_redacted_sql(&changes, &ctx);
+        let redacted = render_redacted_sql(&changes, &ctx).unwrap();
 
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("my_secret_pw"));
@@ -4671,7 +4833,7 @@ mod tests {
             password: "super_secret".to_string(),
         }];
         let ctx = pgroles_core::sql::SqlContext::default();
-        let full = render_full_sql(&changes, &ctx);
+        let full = render_full_sql(&changes, &ctx).unwrap();
 
         assert!(full.contains("super_secret") || full.contains("SCRAM-SHA-256"));
     }
@@ -4822,14 +4984,14 @@ mod tests {
         // which is exactly why it is no longer the approval identity.
         let ctx = pgroles_core::sql::SqlContext::default();
         assert_ne!(
-            compute_sql_hash(&render_full_sql(
-                &[set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")],
-                &ctx
-            )),
-            compute_sql_hash(&render_full_sql(
-                &[set_password("app", "SCRAM-SHA-256$4096:bbb$sB:vB")],
-                &ctx
-            )),
+            compute_sql_hash(
+                &render_full_sql(&[set_password("app", "SCRAM-SHA-256$4096:aaa$sA:vA")], &ctx)
+                    .unwrap()
+            ),
+            compute_sql_hash(
+                &render_full_sql(&[set_password("app", "SCRAM-SHA-256$4096:bbb$sB:vB")], &ctx)
+                    .unwrap()
+            ),
         );
     }
 
@@ -4960,6 +5122,260 @@ mod tests {
                 ..Default::default()
             };
             assert!(!supersedes_after_create(&status, "any-digest"));
+        }
+    }
+
+    /// An actionable plan holding `digest`, created `age_secs` before epoch
+    /// second 1_000_000, optionally pinned to a candidate base.
+    fn actionable_plan(
+        name: &str,
+        phase: PlanPhase,
+        digest: &str,
+        age_secs: i64,
+        base: Option<&str>,
+    ) -> PostgresPolicyPlan {
+        let mut plan = PostgresPolicyPlan::new(name, test_plan_spec());
+        plan.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                jiff::Timestamp::from_second(1_000_000 - age_secs).expect("epoch second in range"),
+            ));
+        plan.spec.origin = base.map(|base| PlanOrigin {
+            kind: "PostgresPolicyCandidate".to_string(),
+            name: "candidate".to_string(),
+            uid: "candidate-uid".to_string(),
+            content_digest: None,
+            content_digest_encoding: None,
+            policy_uid: None,
+            base_content_digest: Some(base.to_string()),
+        });
+        plan.status = Some(PostgresPolicyPlanStatus {
+            phase,
+            change_digest: Some(digest.to_string()),
+            change_digest_encoding: Some(APPROVAL_EFFECT_ENCODING_V3.to_string()),
+            ..Default::default()
+        });
+        plan
+    }
+
+    fn reused_name(
+        plans: &[PostgresPolicyPlan],
+        digest: &str,
+        base: Option<&str>,
+        reuse: PlanReuse,
+    ) -> Option<String> {
+        reusable_plan(plans, digest, base, reuse).map(|plan| plan.name_any())
+    }
+
+    fn cause(
+        plan: &PostgresPolicyPlan,
+        digest: &str,
+        base: Option<&str>,
+        reuse: PlanReuse,
+    ) -> Option<SupersedeCause> {
+        supersede_cause(
+            plan,
+            plan.status.as_ref().expect("status"),
+            "kept",
+            digest,
+            base,
+            &BTreeMap::new(),
+            reuse,
+        )
+    }
+
+    fn with_decision(mut plan: PostgresPolicyPlan, decision: &str) -> PostgresPolicyPlan {
+        let status = plan.status.as_mut().expect("status");
+        status.conditions.push(PolicyCondition {
+            condition_type: decision.to_string(),
+            status: "True".to_string(),
+            reason: Some("DecidedByReviewer".to_string()),
+            message: None,
+            last_transition_time: Some(crate::crd::now_rfc3339()),
+        });
+        status.decided_by = Some(crate::crd::DecisionActor {
+            username: "reviewer@example.com".to_string(),
+            uid: Some("uid-1".to_string()),
+            groups: vec![],
+        });
+        plan
+    }
+
+    #[test]
+    fn under_auto_approval_an_identical_approved_plan_is_reused() {
+        // The loop this closes: a reconcile approves a plan it cannot execute,
+        // the phase change wakes the policy, and a Pending-only lookup misses
+        // the plan it just approved, so it creates and approves another.
+        let plans = [actionable_plan(
+            "approved",
+            PlanPhase::Approved,
+            "d1",
+            10,
+            None,
+        )];
+        assert_eq!(
+            reused_name(&plans, "d1", None, PlanReuse::AutoApproval).as_deref(),
+            Some("approved")
+        );
+        assert_eq!(
+            reused_name(&plans, "d2", None, PlanReuse::AutoApproval),
+            None
+        );
+    }
+
+    #[test]
+    fn outside_auto_approval_an_approved_plan_is_never_handed_back() {
+        // Manual replacement must get a fresh plan rather than the approved
+        // one it is replacing, and observe mode must not adopt an approval
+        // nobody gave it.
+        let plans = [actionable_plan(
+            "approved",
+            PlanPhase::Approved,
+            "d1",
+            10,
+            None,
+        )];
+        assert_eq!(
+            reused_name(&plans, "d1", None, PlanReuse::PendingOnly),
+            None
+        );
+        let pending = [actionable_plan(
+            "pending",
+            PlanPhase::Pending,
+            "d1",
+            10,
+            None,
+        )];
+        assert_eq!(
+            reused_name(&pending, "d1", None, PlanReuse::PendingOnly).as_deref(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn a_denied_plan_is_never_reused() {
+        // A blocked auto plan can wait Pending long enough for a reviewer to
+        // deny it; reusing it would carry the denial into execution.
+        for reuse in [PlanReuse::PendingOnly, PlanReuse::AutoApproval] {
+            let plans = [with_decision(
+                actionable_plan("denied", PlanPhase::Pending, "d1", 10, None),
+                "Denied",
+            )];
+            assert_eq!(reused_name(&plans, "d1", None, reuse), None);
+        }
+    }
+
+    #[test]
+    fn auto_reuse_prefers_a_recorded_decision_then_the_newest_plan() {
+        let plans = [
+            actionable_plan("pending-newest", PlanPhase::Pending, "d1", 1, None),
+            actionable_plan("approved-old", PlanPhase::Approved, "d1", 30, None),
+            actionable_plan("approved-new", PlanPhase::Approved, "d1", 20, None),
+        ];
+        assert_eq!(
+            reused_name(&plans, "d1", None, PlanReuse::AutoApproval).as_deref(),
+            Some("approved-new")
+        );
+        // List order must not decide.
+        let reversed: Vec<_> = plans.iter().rev().cloned().collect();
+        assert_eq!(
+            reused_name(&reversed, "d1", None, PlanReuse::AutoApproval).as_deref(),
+            Some("approved-new")
+        );
+    }
+
+    #[test]
+    fn reuse_never_crosses_a_base_pin_or_revives_a_settled_plan() {
+        let plans = [
+            actionable_plan("other-base", PlanPhase::Approved, "d1", 5, Some("base-a")),
+            actionable_plan("applied", PlanPhase::Applied, "d1", 1, Some("base-b")),
+            actionable_plan("superseded", PlanPhase::Superseded, "d1", 1, Some("base-b")),
+            actionable_plan("failed", PlanPhase::Failed, "d1", 1, Some("base-b")),
+        ];
+        assert_eq!(
+            reused_name(&plans, "d1", Some("base-b"), PlanReuse::AutoApproval),
+            None
+        );
+        assert_eq!(
+            reused_name(&plans, "d1", Some("base-a"), PlanReuse::AutoApproval).as_deref(),
+            Some("other-base")
+        );
+    }
+
+    #[test]
+    fn auto_reuse_retires_identical_duplicates_but_keeps_their_decisions() {
+        // Clusters upgraded from a controller that minted a plan per wake can
+        // hold many identical approved plans. Only the reused one stays live.
+        let kept = actionable_plan("kept", PlanPhase::Approved, "d1", 1, None);
+        let duplicate = with_decision(
+            actionable_plan("duplicate", PlanPhase::Approved, "d1", 3, None),
+            "Approved",
+        );
+        let pending_copy = actionable_plan("pending-copy", PlanPhase::Pending, "d1", 2, None);
+
+        assert_eq!(cause(&kept, "d1", None, PlanReuse::AutoApproval), None);
+        for plan in [&duplicate, &pending_copy] {
+            assert_eq!(
+                cause(plan, "d1", None, PlanReuse::AutoApproval),
+                Some(SupersedeCause::DuplicateOfActionablePlan),
+                "{} still looks actionable beside the reused plan",
+                plan.name_any()
+            );
+        }
+        let retired = superseded_status(
+            duplicate.status.as_ref().expect("status"),
+            SupersedeCause::DuplicateOfActionablePlan,
+        );
+        assert_eq!(retired.phase, PlanPhase::Superseded);
+        assert_eq!(
+            retired.decided_by,
+            duplicate.status.as_ref().and_then(|s| s.decided_by.clone()),
+            "the reviewer's decision is history, not something a duplicate sweep rewrites"
+        );
+        assert!(
+            retired
+                .conditions
+                .iter()
+                .any(|c| c.condition_type == "Approved" && c.status == "True")
+        );
+    }
+
+    #[test]
+    fn outside_auto_approval_a_current_approval_is_never_discarded() {
+        // The documented rule for manual and observe modes is unchanged: an
+        // approval that still describes the current effects survives a create.
+        let approved = with_decision(
+            actionable_plan("approved", PlanPhase::Approved, "d1", 3, None),
+            "Approved",
+        );
+        assert_eq!(cause(&approved, "d1", None, PlanReuse::PendingOnly), None);
+    }
+
+    #[test]
+    fn supersede_cause_keeps_existing_retirement_rules() {
+        for reuse in [PlanReuse::PendingOnly, PlanReuse::AutoApproval] {
+            // A different base outranks matching effects.
+            let pinned = actionable_plan("pinned", PlanPhase::Approved, "d1", 1, Some("old"));
+            assert_eq!(
+                cause(&pinned, "d1", Some("new"), reuse),
+                Some(SupersedeCause::BaseContentChanged)
+            );
+            // An approval of other effects can no longer authorise anything.
+            let stale = actionable_plan("stale", PlanPhase::Approved, "d0", 1, None);
+            assert_eq!(
+                cause(&stale, "d1", None, reuse),
+                Some(SupersedeCause::ReplacedByNewerPlan)
+            );
+            // Settled plans are history.
+            for phase in [
+                PlanPhase::Applied,
+                PlanPhase::Applying,
+                PlanPhase::Failed,
+                PlanPhase::Rejected,
+                PlanPhase::Superseded,
+            ] {
+                let settled = actionable_plan("settled", phase, "d1", 1, None);
+                assert_eq!(cause(&settled, "d1", None, reuse), None);
+            }
         }
     }
 

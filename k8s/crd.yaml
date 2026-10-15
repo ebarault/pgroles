@@ -113,7 +113,13 @@
                             "required": [
                               "type"
                             ],
-                            "type": "object"
+                            "type": "object",
+                            "x-kubernetes-validations": [
+                              {
+                                "message": "scope and impersonateServiceAccount are only supported with gcp_workload_identity",
+                                "rule": "self.type == 'gcp_workload_identity' || (!has(self.scope) && !has(self.impersonateServiceAccount))"
+                              }
+                            ]
                           },
                           "dbname": {
                             "description": "Database name as a literal value.",
@@ -1135,6 +1141,12 @@
                         "format": "int32",
                         "type": "integer"
                       },
+                      "members_options_changed": {
+                        "default": 0,
+                        "description": "Number of grantor-attributed membership option changes.",
+                        "format": "int32",
+                        "type": "integer"
+                      },
                       "members_removed": {
                         "default": 0,
                         "description": "Number of membership removals.",
@@ -1248,6 +1260,11 @@
                       "name"
                     ],
                     "type": "object"
+                  },
+                  "lastAttemptedReconcileAt": {
+                    "description": "Last force-reconcile annotation value whose reconcile ran, whatever its\noutcome — including a refusal or failure. Lock contention does not\ncount: that reconcile has not evaluated the policy yet.",
+                    "nullable": true,
+                    "type": "string"
                   },
                   "lastHandledReconcileAt": {
                     "description": "Last force-reconcile annotation value handled by the operator.",

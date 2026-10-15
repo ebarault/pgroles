@@ -21,10 +21,37 @@ pub enum AzureAuthError {
     ReadAssertion(#[from] std::io::Error),
     #[error("Azure token request failed: {0}")]
     Request(#[from] reqwest::Error),
-    #[error("Azure token endpoint returned HTTP {0}")]
-    Rejected(u16),
+    #[error("Azure token endpoint returned HTTP {status}: {body}")]
+    Rejected { status: u16, body: String },
     #[error("Azure token response has no usable access token or expiry")]
     InvalidResponse,
+}
+
+impl AzureAuthError {
+    /// Configuration errors need a policy change or a repaired token mount.
+    pub fn is_non_transient(&self) -> bool {
+        match self {
+            Self::MissingEnvironment(_) | Self::InvalidTenant | Self::InvalidResponse => true,
+            Self::ReadAssertion(error) => error.kind() == std::io::ErrorKind::NotFound,
+            Self::Rejected { status, .. } => (400..500).contains(status) && *status != 429,
+            Self::Request(_) => false,
+        }
+    }
+}
+
+fn truncate_error_body(mut body: String, assertion: &str) -> String {
+    // An endpoint may echo an invalid assertion; never include it in diagnostics.
+    body = body.replace(assertion, "[redacted]");
+    const MAX_ERROR_BODY_BYTES: usize = 512;
+    if body.len() > MAX_ERROR_BODY_BYTES {
+        let mut end = MAX_ERROR_BODY_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        body.push_str("...");
+    }
+    body
 }
 
 #[derive(Debug)]
@@ -87,7 +114,15 @@ async fn fetch_token(
         .send()
         .await?;
     if !response.status().is_success() {
-        return Err(AzureAuthError::Rejected(response.status().as_u16()));
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "failed to read error body".into());
+        return Err(AzureAuthError::Rejected {
+            status,
+            body: truncate_error_body(body, assertion.trim()),
+        });
     }
     let body: TokenResponse = response.json().await?;
     if body.access_token.trim().is_empty() || body.expires_in == 0 {
@@ -103,6 +138,90 @@ async fn fetch_token(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn missing_projected_token_is_non_transient() {
+        let token_file = std::env::temp_dir().join(format!(
+            "pgroles-azure-missing-{}/token",
+            std::process::id()
+        ));
+        let error = fetch_token(
+            &reqwest::Client::new(),
+            "http://unused",
+            "client-id",
+            &token_file,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AzureAuthError::ReadAssertion(source) if source.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(error.is_non_transient());
+        assert!(
+            !AzureAuthError::ReadAssertion(std::io::ErrorKind::Interrupted.into())
+                .is_non_transient()
+        );
+    }
+
+    #[test]
+    fn error_body_retains_diagnostics_and_redacts_assertion_before_utf8_truncation() {
+        let body = format!("AADSTS70021: assertion-secret {}", "é".repeat(512));
+        let body = truncate_error_body(body, "assertion-secret");
+        assert!(body.starts_with("AADSTS70021: [redacted]"));
+        assert!(!body.contains("assertion-secret"));
+        assert!(body.len() <= 515);
+        assert!(body.ends_with("..."));
+        let error = AzureAuthError::Rejected { status: 400, body };
+        assert!(error.to_string().contains("AADSTS70021"));
+        assert!(error.is_non_transient());
+        for status in [429, 500, 503] {
+            assert!(
+                !AzureAuthError::Rejected {
+                    status,
+                    body: String::new()
+                }
+                .is_non_transient()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_exchange_keeps_entra_error_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let token_file =
+            std::env::temp_dir().join(format!("pgroles-azure-rejected-{}", std::process::id()));
+        tokio::fs::write(&token_file, "projected-assertion")
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !String::from_utf8_lossy(&request)
+                .contains("client_assertion=projected-assertion")
+            {
+                let mut chunk = [0; 1024];
+                let size = socket.read(&mut chunk).await.unwrap();
+                assert!(size > 0 && request.len() < 4096);
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let body = r#"{"error":"invalid_client","error_description":"AADSTS70021: No matching federated identity record found"}"#;
+            socket.write_all(format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let error = fetch_token(&reqwest::Client::new(), &endpoint, "client-id", &token_file)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AzureAuthError::Rejected { status: 400, body } if body.contains("AADSTS70021"))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("No matching federated identity record found")
+        );
+        server.await.unwrap();
+        tokio::fs::remove_file(token_file).await.unwrap();
+    }
 
     #[tokio::test]
     async fn exchanges_projected_assertion() {

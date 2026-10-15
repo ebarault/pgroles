@@ -7,7 +7,9 @@
 pub mod azure_auth;
 pub mod cloud;
 mod defaults;
+mod guards;
 mod identity;
+mod membership_options;
 mod memberships;
 mod preflight;
 mod privileges;
@@ -31,6 +33,10 @@ use pgroles_core::ownership::ManagedScope;
 
 // Re-export the sub-modules' public items for testing / advanced use.
 pub use cloud::{CloudProvider, PrivilegeLevel, detect_privilege_level};
+pub use guards::{
+    ExecutionBlocker, ExecutionGuard, ExecutionGuardFindings, ExecutionSettings,
+    evaluate_execution_guards, refused_schema_owner_transfers,
+};
 pub use identity::detect_system_identifier;
 pub use memberships::{
     MembershipRow, fetch_memberships, fetch_predefined_memberships, format_predefined_memberships,
@@ -1015,6 +1021,8 @@ pub(crate) fn remove_redundant_schema_owner_grants(graph: &mut RoleGraph) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+pub use membership_options::{MembershipPlanningError, resolve_membership_options};
 
 #[cfg(test)]
 mod tests {

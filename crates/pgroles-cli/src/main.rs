@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -19,8 +18,8 @@ use pgroles_cli::{
     PlanSummary, candidate, format_bundle_plan_json, format_bundle_validation_result,
     format_managed_scope_summary, format_plan_json, format_plan_sql_with_context,
     format_rendered_bundle, format_role_graph_summary, format_validation_result,
-    inject_password_changes, planned_role_drops, read_manifest_file, resolve_passwords,
-    validate_bundle_file, validate_manifest,
+    inject_password_changes, read_manifest_file, resolve_passwords, validate_bundle_file,
+    validate_manifest,
 };
 use pgroles_core::diff::{ReconciliationMode, additive_ignores_absence_assertions, plan_changes};
 use pgroles_core::explorer::ExecutorFacts;
@@ -33,7 +32,7 @@ use pgroles_core::review_artifact::{
     build_review_artifact,
 };
 use pgroles_core::visual::{self, VisualManagedScope, VisualSource};
-use pgroles_inspect::{InspectConfig, inspect_drop_role_safety};
+use pgroles_inspect::InspectConfig;
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -54,7 +53,10 @@ struct Cli {
     command: Commands,
 }
 
-static AZURE_WORKLOAD_IDENTITY: AtomicBool = AtomicBool::new(false);
+struct DatabaseConnection<'a> {
+    url: &'a str,
+    azure_workload_identity: bool,
+}
 
 #[derive(Subcommand)]
 enum Commands {
@@ -104,6 +106,12 @@ enum Commands {
         /// Disable non-zero exit when drift is detected.
         #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "exit_code")]
         no_exit_code: bool,
+
+        /// Evaluate the plan as `apply --allow-schema-owner-transfers` would.
+        /// Without it, an adopt-mode schema ownership transfer is reported as
+        /// one apply refuses, in a warning and in the review artifact.
+        #[arg(long)]
+        allow_schema_owner_transfers: bool,
 
         /// Write a sanitized, review-only plan artifact to this file.
         #[arg(long)]
@@ -212,7 +220,10 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "default")]
         namespace: String,
 
-        /// Wait until status.lastHandledReconcileAt reflects this request.
+        /// Wait until the operator has run this request. Succeeds once
+        /// status.lastHandledReconcileAt reflects it; fails with the Ready
+        /// reason as soon as status.lastAttemptedReconcileAt shows it ran and
+        /// did not succeed.
         #[arg(long)]
         wait: bool,
 
@@ -447,9 +458,10 @@ async fn main() -> ExitCode {
 const EXIT_DRIFT: u8 = 2;
 const REQUESTED_RECONCILE_ANNOTATION: &str = "reconcile.pgroles.io/requestedAt";
 const LAST_HANDLED_RECONCILE_AT_STATUS_FIELD: &str = "lastHandledReconcileAt";
+const LAST_ATTEMPTED_RECONCILE_AT_STATUS_FIELD: &str = "lastAttemptedReconcileAt";
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    AZURE_WORKLOAD_IDENTITY.store(cli.azure_workload_identity, Ordering::Relaxed);
+    let azure_workload_identity = cli.azure_workload_identity;
     match cli.command {
         Commands::Validate { file, bundle } => {
             cmd_validate(file.as_deref(), bundle.as_deref())?;
@@ -463,6 +475,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             mode,
             exit_code,
             no_exit_code,
+            allow_schema_owner_transfers,
             review_out,
             target_label,
             policy_commit,
@@ -471,9 +484,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_diff(
                 file.as_deref(),
                 bundle.as_deref(),
-                &database_url,
+                &DatabaseConnection {
+                    url: &database_url,
+                    azure_workload_identity,
+                },
                 &format,
-                mode.into(),
+                ApplySettings {
+                    mode: mode.into(),
+                    allow_schema_owner_transfers,
+                },
                 exit_code && !no_exit_code,
                 DiffReviewOptions {
                     review_out: review_out.as_deref(),
@@ -495,7 +514,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_apply(
                 file.as_deref(),
                 bundle.as_deref(),
-                &database_url,
+                &DatabaseConnection {
+                    url: &database_url,
+                    azure_workload_identity,
+                },
                 dry_run,
                 mode.into(),
                 allow_schema_owner_transfers,
@@ -508,7 +530,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             bundle,
             database_url,
         } => {
-            cmd_inspect(file.as_deref(), bundle.as_deref(), &database_url).await?;
+            cmd_inspect(
+                file.as_deref(),
+                bundle.as_deref(),
+                &DatabaseConnection {
+                    url: &database_url,
+                    azure_workload_identity,
+                },
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Generate {
@@ -518,7 +548,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             suggest_min_schemas,
         } => {
             cmd_generate(
-                &database_url,
+                &DatabaseConnection {
+                    url: &database_url,
+                    azure_workload_identity,
+                },
                 output.as_deref(),
                 suggest_profiles,
                 suggest_min_schemas,
@@ -587,7 +620,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 cmd_graph_current(
                     file.as_deref(),
                     bundle.as_deref(),
-                    &database_url,
+                    &DatabaseConnection {
+                        url: &database_url,
+                        azure_workload_identity,
+                    },
                     &scope,
                     &format,
                     output.as_deref(),
@@ -710,6 +746,56 @@ fn handled_reconcile_timestamp(policy: &DynamicObject) -> Option<&str> {
         .as_str()
 }
 
+/// Where a requested reconcile stands, as the policy's status reports it.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestedReconcile {
+    /// The operator has not finished evaluating the request yet.
+    Pending,
+    /// The request reconciled or produced a plan.
+    Handled(String),
+    /// The request ran and did not succeed; the Ready condition says why.
+    Refused { reason: String, message: String },
+}
+
+fn requested_reconcile_state(
+    policy: &DynamicObject,
+    requested: &str,
+) -> Result<RequestedReconcile> {
+    if let Some(handled_at) = handled_reconcile_timestamp(policy)
+        && handled_reconcile_at_least(handled_at, requested)?
+    {
+        return Ok(RequestedReconcile::Handled(handled_at.to_string()));
+    }
+    let status = policy.data.get("status");
+    let attempted = status
+        .and_then(|status| status.get(LAST_ATTEMPTED_RECONCILE_AT_STATUS_FIELD))
+        .and_then(|value| value.as_str());
+    match attempted {
+        Some(attempted_at) if handled_reconcile_at_least(attempted_at, requested)? => {
+            let ready = status
+                .and_then(|status| status.get("conditions"))
+                .and_then(|conditions| conditions.as_array())
+                .and_then(|conditions| {
+                    conditions.iter().find(|condition| {
+                        condition.get("type").and_then(|t| t.as_str()) == Some("Ready")
+                    })
+                });
+            let field = |name: &str| {
+                ready
+                    .and_then(|condition| condition.get(name))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string()
+            };
+            Ok(RequestedReconcile::Refused {
+                reason: field("reason"),
+                message: field("message"),
+            })
+        }
+        _ => Ok(RequestedReconcile::Pending),
+    }
+}
+
 fn handled_reconcile_at_least(handled: &str, requested: &str) -> Result<bool> {
     let handled: jiff::Timestamp = handled.parse().with_context(|| {
         format!("invalid status.{LAST_HANDLED_RECONCILE_AT_STATUS_FIELD} timestamp {handled:?}")
@@ -773,14 +859,21 @@ async fn wait_for_reconcile_handled(
             .get(name)
             .await
             .with_context(|| format!("failed to read postgrespolicy/{name} while waiting"))?;
-        if let Some(handled_at) = handled_reconcile_timestamp(&policy)
-            && handled_reconcile_at_least(handled_at, requested_at)?
-        {
-            println!(
-                "Reconcile request handled at {} for postgrespolicy/{}.",
-                handled_at, name
-            );
-            return Ok(());
+        match requested_reconcile_state(&policy, requested_at)? {
+            RequestedReconcile::Handled(handled_at) => {
+                println!(
+                    "Reconcile request handled at {} for postgrespolicy/{}.",
+                    handled_at, name
+                );
+                return Ok(());
+            }
+            RequestedReconcile::Refused { reason, message } => {
+                anyhow::bail!(
+                    "postgrespolicy/{name} reconciled for this request but did not succeed: \
+                     {reason}: {message}"
+                );
+            }
+            RequestedReconcile::Pending => {}
         }
 
         if started.elapsed() >= timeout {
@@ -996,8 +1089,7 @@ struct ReviewArtifactBuildInput<'a> {
     changes: &'a [pgroles_core::diff::Change],
     change_sources: Option<&'a [pgroles_core::report::BundleChangeOwner]>,
     sql_context: &'a pgroles_core::sql::SqlContext,
-    authority_issues: &'a [pgroles_inspect::AuthorityIssue],
-    drop_safety: &'a pgroles_inspect::DropRoleSafetyAssessment,
+    guards: &'a pgroles_inspect::ExecutionGuardFindings,
 }
 
 /// A grantor-less object revoke is checked only for the objects
@@ -1035,7 +1127,9 @@ fn targeted_authority_coverage(
     let has_membership_change = changes.iter().any(|change| {
         matches!(
             change,
-            Change::AddMember { .. } | Change::RemoveMember { .. }
+            Change::AddMember { .. }
+                | Change::UpdateMemberOptions { .. }
+                | Change::RemoveMember { .. }
         )
     });
     let phase_checks_active = !inspector_is_superuser && pg_major_version >= 16;
@@ -1081,6 +1175,10 @@ fn targeted_authority_coverage(
                 }
                 checked
             }
+            Change::UpdateMemberOptions { .. } => {
+                checks_performed.insert(EvidenceCheck::GrantorReachability);
+                true
+            }
             Change::RemoveMember { role, grantor, .. } => {
                 if pgroles_core::manifest::is_predefined_role(role) {
                     checks_performed.insert(EvidenceCheck::PredefinedRoleMembership);
@@ -1123,9 +1221,10 @@ fn build_cli_review_artifact(input: ReviewArtifactBuildInput<'_>) -> Result<Revi
         changes,
         change_sources,
         sql_context,
-        authority_issues,
-        drop_safety,
+        guards,
     } = input;
+    let authority_issues = &guards.authority;
+    let drop_safety = &guards.drop_safety;
     let intended_executor = intended_executor.unwrap_or(&inspector.user_name);
     let intended_is_inspector = intended_executor == inspector.user_name;
     let authority_coverage = targeted_authority_coverage(
@@ -1179,6 +1278,36 @@ fn build_cli_review_artifact(input: ReviewArtifactBuildInput<'_>) -> Result<Revi
                 },
                 checked_change_indices: drop_checked,
                 unchecked_change_indices: drop_unchecked,
+            },
+        },
+        // The ownership rule is exact, not a probe: every change is covered,
+        // and only an adopt-mode transfer the run did not allow fails it.
+        PreflightEvidence {
+            check: PreflightCheck::SchemaOwnerTransfer,
+            status: if guards.refused_schema_owner_transfers.is_empty() {
+                EvidenceStatus::Passed
+            } else {
+                EvidenceStatus::Failed
+            },
+            actor_role: None,
+            issue_count: guards.refused_schema_owner_transfers.len(),
+            issues: guards
+                .refused_schema_owner_transfers
+                .iter()
+                .map(|(schema, owner)| PreflightFinding {
+                    code: "adopt_schema_owner_transfer".to_string(),
+                    message: format!(
+                        "adopt mode would transfer ownership of schema \"{schema}\"; apply \
+                         refuses it without --allow-schema-owner-transfers"
+                    ),
+                    role: Some(owner.clone()),
+                })
+                .collect(),
+            coverage: EvidenceCoverage {
+                kind: EvidenceCoverageKind::Complete,
+                checks_performed: vec![EvidenceCheck::SchemaOwnerTransfer],
+                checked_change_indices: (0..changes.len()).collect(),
+                unchecked_change_indices: Vec::new(),
             },
         },
         PreflightEvidence {
@@ -1241,6 +1370,7 @@ fn build_cli_review_artifact(input: ReviewArtifactBuildInput<'_>) -> Result<Revi
         executor_facts: ExecutorFacts {
             role: intended_executor.to_string(),
             superuser: intended_is_inspector && inspector.superuser,
+            bootstrap_role: None,
             createrole: Default::default(),
             memberships: Vec::new(),
             new_membership_set_role: Default::default(),
@@ -1272,6 +1402,9 @@ fn authority_preflight_findings(
         .map(|issue| {
             use pgroles_inspect::AuthorityIssue;
             let (code, role) = match issue {
+                AuthorityIssue::MembershipOptionsBlocked { role, .. } => {
+                    ("membership_options_blocked", Some(role.clone()))
+                }
                 AuthorityIssue::DefaultPrivilegeOwner { owner, .. }
                 | AuthorityIssue::MissingDefaultPrivilegeOwner { owner } => {
                     ("default_privilege_owner", Some(owner.clone()))
@@ -1343,6 +1476,12 @@ fn drop_safety_concern_count(issue: &pgroles_inspect::DropRoleSafetyIssue) -> us
 }
 
 #[derive(Clone, Copy)]
+/// How the apply that `diff` previews would run.
+struct ApplySettings {
+    mode: ReconciliationMode,
+    allow_schema_owner_transfers: bool,
+}
+
 struct DiffReviewOptions<'a> {
     review_out: Option<&'a Path>,
     target_label: Option<&'a str>,
@@ -1393,7 +1532,7 @@ fn render_diff_report(
                 report.stdout = "-- No changes needed. Database is in sync with manifest.\n".into();
             } else {
                 let sql_context = sql_context.expect("SQL output requested SQL context");
-                report.stdout = format_plan_sql_with_context(changes, sql_context);
+                report.stdout = format_plan_sql_with_context(changes, sql_context)?;
                 report.stderr = format!("\n{summary}\n{drop_safety_note}");
             }
         }
@@ -1449,12 +1588,16 @@ fn finish_diff(
 async fn cmd_diff(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    database_url: &str,
+    connection: &DatabaseConnection<'_>,
     format: &OutputFormat,
-    mode: ReconciliationMode,
+    apply: ApplySettings,
     use_exit_code: bool,
     review: DiffReviewOptions<'_>,
 ) -> Result<ExitCode> {
+    let ApplySettings {
+        mode,
+        allow_schema_owner_transfers,
+    } = apply;
     let DiffReviewOptions {
         review_out,
         target_label,
@@ -1466,7 +1609,7 @@ async fn cmd_diff(
     }
     if let Some(bundle_path) = bundle {
         let validated = validate_bundle_file(bundle_path)?;
-        let pool = connect_db(database_url).await?;
+        let pool = connect_db(connection).await?;
         let inspect_config = inspect_config_for_bundle(&validated);
         let current = inspect_current_for_plan_with_config(&pool, &inspect_config).await?;
         info!(%mode, "reconciliation mode");
@@ -1485,13 +1628,22 @@ async fn cmd_diff(
             &validated.composed.expanded.roles,
         );
         let changes = diff_password_changes(changes, &validated.composed.expanded, format)?;
+        let changes = pgroles_inspect::resolve_membership_options(&pool, changes, &current).await?;
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
         )?;
-        let authority_issues = preflight_authority(&pool, &changes, &current, false).await?;
-        let drop_safety =
-            inspect_drop_safety(&pool, &changes, &validated.composed.manifest.retirements).await?;
+        let guards = evaluate_apply_guards(
+            &pool,
+            mode,
+            allow_schema_owner_transfers,
+            &changes,
+            &current,
+            &validated.composed.manifest.retirements,
+        )
+        .await?;
+        warn_apply_refusals(&guards);
+        let drop_safety = &guards.drop_safety;
         let summary = PlanSummary::from_changes(&changes);
         let sql_context = if matches!(format, OutputFormat::Sql) || review_out.is_some() {
             Some(detect_sql_context_with_config(&pool, &inspect_config).await?)
@@ -1531,8 +1683,7 @@ async fn cmd_diff(
                         sql_context: sql_context
                             .as_ref()
                             .expect("review artifact requested SQL context"),
-                        authority_issues: &authority_issues,
-                        drop_safety: &drop_safety,
+                        guards: &guards,
                     })?;
                     write_review_artifact(review_path, &artifact)
                 }
@@ -1547,7 +1698,7 @@ async fn cmd_diff(
                 format,
                 changes: &changes,
                 summary: &summary,
-                drop_safety: &drop_safety,
+                drop_safety,
                 sql_context: sql_context.as_ref(),
                 review_fingerprint: export.as_ref().and_then(|result| result.as_deref().ok()),
             },
@@ -1573,7 +1724,7 @@ async fn cmd_diff(
     let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
 
-    let pool = connect_db(database_url).await?;
+    let pool = connect_db(connection).await?;
     let current = inspect_current_for_plan(&pool, &validated).await?;
 
     info!(%mode, "reconciliation mode");
@@ -1592,8 +1743,18 @@ async fn cmd_diff(
         &validated.expanded.roles,
     );
     let changes = diff_password_changes(changes, &validated.expanded, format)?;
-    let authority_issues = preflight_authority(&pool, &changes, &current, false).await?;
-    let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
+    let changes = pgroles_inspect::resolve_membership_options(&pool, changes, &current).await?;
+    let guards = evaluate_apply_guards(
+        &pool,
+        mode,
+        allow_schema_owner_transfers,
+        &changes,
+        &current,
+        &validated.manifest.retirements,
+    )
+    .await?;
+    warn_apply_refusals(&guards);
+    let drop_safety = &guards.drop_safety;
     let summary = PlanSummary::from_changes(&changes);
     let sql_context = if matches!(format, OutputFormat::Sql) || review_out.is_some() {
         Some(detect_sql_context(&pool, &validated.expanded).await?)
@@ -1620,8 +1781,7 @@ async fn cmd_diff(
                     sql_context: sql_context
                         .as_ref()
                         .expect("review artifact requested SQL context"),
-                    authority_issues: &authority_issues,
-                    drop_safety: &drop_safety,
+                    guards: &guards,
                 })?;
                 write_review_artifact(review_path, &artifact)
             }
@@ -1635,7 +1795,7 @@ async fn cmd_diff(
             format,
             changes: &changes,
             summary: &summary,
-            drop_safety: &drop_safety,
+            drop_safety,
             sql_context: sql_context.as_ref(),
             review_fingerprint: export.as_ref().and_then(|result| result.as_deref().ok()),
         },
@@ -1662,14 +1822,14 @@ async fn cmd_diff(
 async fn cmd_apply(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    database_url: &str,
+    connection: &DatabaseConnection<'_>,
     dry_run: bool,
     mode: ReconciliationMode,
     allow_schema_owner_transfers: bool,
 ) -> Result<()> {
     if let Some(bundle_path) = bundle {
         let validated = validate_bundle_file(bundle_path)?;
-        let pool = connect_db(database_url).await?;
+        let pool = connect_db(connection).await?;
         let inspect_config = inspect_config_for_bundle(&validated);
         let sql_ctx = detect_sql_context_with_config(&pool, &inspect_config).await?;
 
@@ -1691,7 +1851,6 @@ async fn cmd_apply(
             &validated.composed.expanded,
             mode,
         );
-        enforce_adopt_owner_transfer_guard(mode, allow_schema_owner_transfers, &changes)?;
         warn_adopt_schema_owner_transfers(mode, &changes);
         warn_undeclared_default_owner(
             validated.composed.manifest.default_owner.as_deref(),
@@ -1700,6 +1859,7 @@ async fn cmd_apply(
         let resolved_passwords = resolve_passwords(&validated.composed.expanded)
             .context("failed to resolve role passwords")?;
         let changes = inject_password_changes(changes, &resolved_passwords);
+        let changes = pgroles_inspect::resolve_membership_options(&pool, changes, &current).await?;
         validate_changes_against_managed_surface(
             &changes,
             &validated.composed.managed_change_surface,
@@ -1715,8 +1875,19 @@ async fn cmd_apply(
             }
         }
 
-        let drop_safety =
-            inspect_drop_safety(&pool, &changes, &validated.composed.manifest.retirements).await?;
+        let guards = evaluate_apply_guards(
+            &pool,
+            mode,
+            allow_schema_owner_transfers,
+            &changes,
+            &current,
+            &validated.composed.manifest.retirements,
+        )
+        .await?;
+        if let Some(refusal) = guards.owner_transfer_refusal() {
+            anyhow::bail!("{refusal}");
+        }
+        let drop_safety = &guards.drop_safety;
         let summary = PlanSummary::from_changes(&changes);
 
         if summary.is_empty() {
@@ -1724,20 +1895,20 @@ async fn cmd_apply(
             return Ok(());
         }
 
-        let sql_output = format_plan_sql_with_context(&changes, &sql_ctx);
+        let sql_output = format_plan_sql_with_context(&changes, &sql_ctx)?;
 
         if dry_run {
             println!("-- DRY RUN: the following SQL would be executed:\n");
             print!("{sql_output}");
             eprintln!("\n{}", summary.format_plan());
-            let _ = preflight_authority(&pool, &changes, &current, false).await?;
+            warn_authority_issues(&guards.authority);
             if !drop_safety.is_empty() {
                 eprintln!("\n{drop_safety}");
             }
             return Ok(());
         }
 
-        let _ = preflight_authority(&pool, &changes, &current, true).await?;
+        refuse_authority_issues(&guards.authority)?;
 
         if drop_safety.has_blockers() {
             anyhow::bail!("{}", drop_safety.blockers);
@@ -1764,7 +1935,7 @@ async fn cmd_apply(
     let yaml = read_manifest_file(file_path)?;
     let validated = validate_manifest(&yaml)?;
 
-    let pool = connect_db(database_url).await?;
+    let pool = connect_db(connection).await?;
     let sql_ctx = detect_sql_context(&pool, &validated.expanded).await?;
 
     // Detect cloud provider privilege level and warn about unsupported operations.
@@ -1785,7 +1956,6 @@ async fn cmd_apply(
         &validated.expanded,
         mode,
     );
-    enforce_adopt_owner_transfer_guard(mode, allow_schema_owner_transfers, &changes)?;
     warn_adopt_schema_owner_transfers(mode, &changes);
     warn_undeclared_default_owner(
         validated.manifest.default_owner.as_deref(),
@@ -1794,6 +1964,7 @@ async fn cmd_apply(
     let resolved_passwords =
         resolve_passwords(&validated.expanded).context("failed to resolve role passwords")?;
     let changes = inject_password_changes(changes, &resolved_passwords);
+    let changes = pgroles_inspect::resolve_membership_options(&pool, changes, &current).await?;
     // Validate changes against privilege level.
     let priv_warnings =
         pgroles_inspect::cloud::validate_changes_for_privilege_level(&changes, &privilege_level);
@@ -1803,7 +1974,19 @@ async fn cmd_apply(
         }
     }
 
-    let drop_safety = inspect_drop_safety(&pool, &changes, &validated.manifest.retirements).await?;
+    let guards = evaluate_apply_guards(
+        &pool,
+        mode,
+        allow_schema_owner_transfers,
+        &changes,
+        &current,
+        &validated.manifest.retirements,
+    )
+    .await?;
+    if let Some(refusal) = guards.owner_transfer_refusal() {
+        anyhow::bail!("{refusal}");
+    }
+    let drop_safety = &guards.drop_safety;
     let summary = PlanSummary::from_changes(&changes);
 
     if summary.is_empty() {
@@ -1811,20 +1994,20 @@ async fn cmd_apply(
         return Ok(());
     }
 
-    let sql_output = format_plan_sql_with_context(&changes, &sql_ctx);
+    let sql_output = format_plan_sql_with_context(&changes, &sql_ctx)?;
 
     if dry_run {
         println!("-- DRY RUN: the following SQL would be executed:\n");
         print!("{sql_output}");
         eprintln!("\n{}", summary.format_plan());
-        let _ = preflight_authority(&pool, &changes, &current, false).await?;
+        warn_authority_issues(&guards.authority);
         if !drop_safety.is_empty() {
             eprintln!("\n{drop_safety}");
         }
         return Ok(());
     }
 
-    let _ = preflight_authority(&pool, &changes, &current, true).await?;
+    refuse_authority_issues(&guards.authority)?;
 
     if drop_safety.has_blockers() {
         anyhow::bail!("{}", drop_safety.blockers);
@@ -1847,7 +2030,11 @@ async fn cmd_apply(
     Ok(())
 }
 
-async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &str) -> Result<()> {
+async fn cmd_inspect(
+    file: Option<&Path>,
+    bundle: Option<&Path>,
+    connection: &DatabaseConnection<'_>,
+) -> Result<()> {
     // Validate manifest or bundle before connecting so YAML errors fail fast.
     let validated_manifest = match (file, bundle) {
         (Some(path), None) => {
@@ -1863,7 +2050,7 @@ async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &
         (Some(_), Some(_)) => unreachable!("clap enforces conflicts"),
     };
 
-    let pool = connect_db(database_url).await?;
+    let pool = connect_db(connection).await?;
 
     let current = if let Some(ref validated) = validated_manifest {
         inspect_current(&pool, validated).await?
@@ -1915,12 +2102,12 @@ async fn cmd_inspect(file: Option<&Path>, bundle: Option<&Path>, database_url: &
 }
 
 async fn cmd_generate(
-    database_url: &str,
+    connection: &DatabaseConnection<'_>,
     output: Option<&Path>,
     suggest_profiles: bool,
     suggest_min_schemas: usize,
 ) -> Result<()> {
-    let pool = connect_db(database_url).await?;
+    let pool = connect_db(connection).await?;
 
     // Introspect all non-system roles by using an unscoped inspect config.
     info!("introspecting all non-system roles for manifest generation");
@@ -2098,7 +2285,7 @@ fn cmd_graph_desired(
 async fn cmd_graph_current(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    database_url: &str,
+    connection: &DatabaseConnection<'_>,
     scope: &GraphScope,
     format: &GraphFormat,
     output: Option<&Path>,
@@ -2110,7 +2297,7 @@ async fn cmd_graph_current(
         );
     }
 
-    let pool = connect_db(database_url).await?;
+    let pool = connect_db(connection).await?;
 
     let graph = match scope {
         GraphScope::Managed => {
@@ -2175,15 +2362,15 @@ fn write_output(content: &str, output: Option<&Path>) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn connect_db(database_url: &str) -> Result<PgPool> {
+async fn connect_db(connection: &DatabaseConnection<'_>) -> Result<PgPool> {
     info!("connecting to database");
     // The CLI is a one-shot tool, so prefer a single pooled connection. This
     // avoids hopping across different backends when a hostname resolves to
     // multiple PostgreSQL servers.
     let mut options =
-        PgConnectOptions::from_str(database_url).context("invalid PostgreSQL connection URL")?;
-    if AZURE_WORKLOAD_IDENTITY.load(Ordering::Relaxed) {
-        let parsed = reqwest::Url::parse(database_url)
+        PgConnectOptions::from_str(connection.url).context("invalid PostgreSQL connection URL")?;
+    if connection.azure_workload_identity {
+        let parsed = reqwest::Url::parse(connection.url)
             .context("Azure authentication requires a PostgreSQL URL")?;
         anyhow::ensure!(
             parsed.password().is_none() && !parsed.query_pairs().any(|(key, _)| key == "password"),
@@ -2300,7 +2487,7 @@ async fn execute_changes(
         }
     };
 
-    for statement in pgroles_core::sql::render_batch_with_context(changes, sql_ctx) {
+    for statement in pgroles_core::sql::render_batch_with_context(changes, sql_ctx)? {
         info!(sql = %statement.redacted_sql, "executing");
         if let Err(error) = sqlx::query(&statement.sql)
             .execute(transaction.as_mut())
@@ -2463,38 +2650,65 @@ async fn inspect_current_for_plan_with_config(
     Ok(inspection.graph)
 }
 
-/// Report planned default-privilege changes and PUBLIC revokes the executor
-/// lacks the authority to perform. Runs on the final change list, so converged
-/// state never reports anything.
+/// The apply guards, under the settings `pgroles apply` runs with.
 ///
-/// `blocking` is true only where SQL actually runs. `diff` and `apply
-/// --dry-run` execute nothing, so they warn and still produce their plan —
-/// a CI drift check running as a read-only role keeps working. This mirrors
-/// how drop safety is handled, which also warns until the moment of execution.
-async fn preflight_authority(
+/// `diff` and `apply --dry-run` evaluate the same guards and only warn, so a
+/// CI drift check running as a read-only role keeps working while its report
+/// says exactly what the apply would refuse. The operator evaluates a policy
+/// through the same function, with its own settings.
+async fn evaluate_apply_guards(
     pool: &PgPool,
+    mode: ReconciliationMode,
+    allow_schema_owner_transfers: bool,
     changes: &[pgroles_core::diff::Change],
     current: &pgroles_core::model::RoleGraph,
-    blocking: bool,
-) -> Result<Vec<pgroles_inspect::AuthorityIssue>> {
-    let issues = pgroles_inspect::preflight_authority_issues(pool, changes, current)
-        .await
-        .context("failed to check executor authority")?;
-    if issues.is_empty() {
-        return Ok(issues);
+    retirements: &[pgroles_core::manifest::RoleRetirement],
+) -> Result<pgroles_inspect::ExecutionGuardFindings> {
+    pgroles_inspect::evaluate_execution_guards(
+        pool,
+        &pgroles_inspect::ExecutionSettings {
+            executes: true,
+            allow_schema_owner_transfers,
+            transfer_allowance: "pass --allow-schema-owner-transfers",
+        },
+        mode,
+        changes,
+        current,
+        retirements,
+    )
+    .await
+    .context("failed to evaluate the apply guards")
+}
+
+/// Warn, for a command that executes nothing, about everything apply would
+/// refuse. Role-drop safety is reported with the plan itself.
+fn warn_apply_refusals(guards: &pgroles_inspect::ExecutionGuardFindings) {
+    if let Some(refusal) = guards.owner_transfer_refusal() {
+        eprintln!("Warning: apply would refuse this plan: {refusal}");
     }
-    let message = issues
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if blocking {
-        anyhow::bail!("{message}");
-    }
-    for issue in &issues {
+    warn_authority_issues(&guards.authority);
+}
+
+fn warn_authority_issues(issues: &[pgroles_inspect::AuthorityIssue]) {
+    for issue in issues {
         eprintln!("Warning: {issue}");
     }
-    Ok(issues)
+}
+
+/// Refuse to execute a plan the executor lacks the authority to run. A
+/// PUBLIC revoke without that authority would silently no-op.
+fn refuse_authority_issues(issues: &[pgroles_inspect::AuthorityIssue]) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}",
+        issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 fn warn_additive_absence_assertions(
@@ -2508,41 +2722,6 @@ fn warn_additive_absence_assertions(
              use adopt or authoritative mode to enforce absence"
         );
     }
-}
-
-/// Refuse an adopt-mode apply that would transfer schema ownership.
-///
-/// Adopt filters role drops, not ownership convergence: a binding whose
-/// declared owner differs from the live one is transferred even under adopt,
-/// which has surprised brownfield adopters whose schemas were owned by
-/// another system. `--allow-schema-owner-transfers` acknowledges it.
-fn enforce_adopt_owner_transfer_guard(
-    mode: ReconciliationMode,
-    allow_schema_owner_transfers: bool,
-    changes: &[pgroles_core::diff::Change],
-) -> Result<()> {
-    if mode != ReconciliationMode::Adopt || allow_schema_owner_transfers {
-        return Ok(());
-    }
-    let transfers: Vec<String> = changes
-        .iter()
-        .filter_map(|change| match change {
-            pgroles_core::diff::Change::AlterSchemaOwner { name, owner } => {
-                Some(format!("\"{name}\" -> \"{owner}\""))
-            }
-            _ => None,
-        })
-        .collect();
-    if transfers.is_empty() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "adopt mode would transfer ownership of {} schema(s): {}. \
-         Pass --allow-schema-owner-transfers to permit this, use additive mode to skip \
-         transfers, or declare each schema's current owner.",
-        transfers.len(),
-        transfers.join(", ")
-    );
 }
 
 /// Warn when an `ensure: absent` assertion can never converge because the
@@ -2598,18 +2777,6 @@ fn warn_undeclared_default_owner(
              resolves to it. Declare it (external: true) or set the owner per schema."
         );
     }
-}
-
-async fn inspect_drop_safety(
-    pool: &PgPool,
-    changes: &[pgroles_core::diff::Change],
-    retirements: &[pgroles_core::manifest::RoleRetirement],
-) -> Result<pgroles_inspect::DropRoleSafetyAssessment> {
-    let dropped_roles = planned_role_drops(changes);
-    let report = inspect_drop_role_safety(pool, &dropped_roles)
-        .await
-        .context("failed to inspect role-drop safety")?;
-    Ok(report.assess(retirements))
 }
 
 #[cfg(test)]
@@ -2696,6 +2863,63 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_ends_when_the_requested_reconcile_ran_whatever_its_outcome() {
+        let policy = |status: serde_json::Value| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "pgroles.io/v1alpha1",
+                "kind": "PostgresPolicy",
+                "metadata": {"name": "orders"},
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let requested = "2026-05-15T00:00:00Z";
+        assert_eq!(
+            requested_reconcile_state(&policy(serde_json::json!({})), requested).unwrap(),
+            RequestedReconcile::Pending
+        );
+        assert_eq!(
+            requested_reconcile_state(
+                &policy(serde_json::json!({
+                    "lastHandledReconcileAt": requested,
+                    "lastAttemptedReconcileAt": requested,
+                })),
+                requested
+            )
+            .unwrap(),
+            RequestedReconcile::Handled(requested.to_string())
+        );
+        // An older success with a newer refusal reports the refusal.
+        assert_eq!(
+            requested_reconcile_state(
+                &policy(serde_json::json!({
+                    "lastHandledReconcileAt": "2026-05-14T00:00:00Z",
+                    "lastAttemptedReconcileAt": requested,
+                    "conditions": [{
+                        "type": "Ready", "status": "False",
+                        "reason": "ExecutorAuthority", "message": "cannot revoke"
+                    }],
+                })),
+                requested
+            )
+            .unwrap(),
+            RequestedReconcile::Refused {
+                reason: "ExecutorAuthority".into(),
+                message: "cannot revoke".into()
+            }
+        );
+        // An operator that predates the attempt field keeps waiting.
+        assert_eq!(
+            requested_reconcile_state(
+                &policy(serde_json::json!({"lastHandledReconcileAt": "2026-05-14T00:00:00Z"})),
+                requested
+            )
+            .unwrap(),
+            RequestedReconcile::Pending
+        );
+    }
+
+    #[test]
     fn handled_reconcile_at_least_compares_rfc3339_timestamps() {
         assert!(
             handled_reconcile_at_least("2026-05-15T00:00:01Z", "2026-05-15T00:00:00Z")
@@ -2752,6 +2976,22 @@ mod tests {
         assert_eq!(written, "graph output");
     }
 
+    #[tokio::test]
+    async fn azure_connection_rejects_static_password_before_token_acquisition() {
+        for url in [
+            "postgres://operator:password@localhost/postgres",
+            "postgres://operator@localhost/postgres?password=secret",
+        ] {
+            let error = connect_db(&DatabaseConnection {
+                url,
+                azure_workload_identity: true,
+            })
+            .await
+            .expect_err("Azure auth must reject a persistent password");
+            assert!(error.to_string().contains("without a password"));
+        }
+    }
+
     #[test]
     fn graph_current_managed_requires_file_before_connecting() {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create runtime");
@@ -2759,7 +2999,10 @@ mod tests {
             .block_on(cmd_graph_current(
                 None,
                 None,
-                "postgres://unused",
+                &DatabaseConnection {
+                    url: "postgres://unused",
+                    azure_workload_identity: false,
+                },
                 &GraphScope::Managed,
                 &GraphFormat::Tree,
                 None,
