@@ -569,15 +569,7 @@ pub enum ConnectionAuth {
     /// server. `username` must be the Cloud SQL PostgreSQL IAM role name
     /// (for service accounts, the email without `.gserviceaccount.com`).
     #[serde(rename = "gcp_workload_identity", rename_all = "camelCase")]
-    GcpWorkloadIdentity {
-        /// Target Google service account to impersonate before requesting the
-        /// Cloud SQL login token. Omit to use the pod's bound identity.
-        #[serde(default)]
-        impersonate_service_account: Option<String>,
-        /// OAuth scope requested for the access token.
-        #[serde(default)]
-        scope: Option<String>,
-    },
+    GcpWorkloadIdentity(GcpWorkloadIdentityAuth),
     /// Exchange the AKS projected service account token for an Entra access
     /// token accepted by Azure Database for PostgreSQL Flexible Server.
     #[serde(rename = "azure_workload_identity")]
@@ -588,6 +580,20 @@ pub enum ConnectionAuth {
         #[schemars(skip)]
         unsupported_fields: BTreeMap<String, serde_json::Value>,
     },
+}
+
+/// GCP-only options cannot be passed to an Azure token provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(inline)]
+pub struct GcpWorkloadIdentityAuth {
+    /// Target Google service account to impersonate before requesting the
+    /// Cloud SQL login token. Omit to use the pod's bound identity.
+    #[serde(default)]
+    impersonate_service_account: Option<String>,
+    /// OAuth scope requested for the access token.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 fn normalize_connection_auth_schema(schema: &mut schemars::Schema) {
@@ -634,34 +640,25 @@ fn normalize_connection_auth_schema(schema: &mut schemars::Schema) {
     }]));
 }
 
-impl ConnectionAuth {
+impl GcpWorkloadIdentityAuth {
     pub fn gcp_scope(&self) -> &str {
-        match self {
-            Self::GcpWorkloadIdentity { scope, .. } => scope
-                .as_deref()
-                .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE),
-            Self::AzureWorkloadIdentity { .. } => {
-                unreachable!("gcp_scope requires GCP authentication")
-            }
-        }
+        self.scope
+            .as_deref()
+            .unwrap_or(DEFAULT_GCP_CLOUD_SQL_LOGIN_SCOPE)
     }
 
     pub fn gcp_impersonate_service_account(&self) -> Option<&str> {
-        match self {
-            Self::GcpWorkloadIdentity {
-                impersonate_service_account,
-                ..
-            } => impersonate_service_account.as_deref(),
-            Self::AzureWorkloadIdentity { .. } => None,
-        }
+        self.impersonate_service_account.as_deref()
     }
+}
 
+impl ConnectionAuth {
     fn cache_key(&self) -> String {
         match self {
-            Self::GcpWorkloadIdentity {
+            Self::GcpWorkloadIdentity(GcpWorkloadIdentityAuth {
                 impersonate_service_account,
                 scope,
-            } => format!(
+            }) => format!(
                 "gcp_workload_identity\0impersonate={}\0scope={}",
                 impersonate_service_account.as_deref().unwrap_or_default(),
                 scope
@@ -2275,10 +2272,10 @@ impl PostgresPolicySpec {
                         return Err(ConnectionValidationError::AuthWithPassword);
                     }
                     match auth {
-                        ConnectionAuth::GcpWorkloadIdentity {
+                        ConnectionAuth::GcpWorkloadIdentity(GcpWorkloadIdentityAuth {
                             impersonate_service_account,
                             scope,
-                        } => {
+                        }) => {
                             if let Some(value) = impersonate_service_account
                                 && value.trim().is_empty()
                             {
@@ -4255,10 +4252,12 @@ mod tests {
                 username_secret: None,
                 password: None,
                 password_secret: None,
-                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
-                    impersonate_service_account: None,
-                    scope: None,
-                }),
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity(
+                    GcpWorkloadIdentityAuth {
+                        impersonate_service_account: None,
+                        scope: None,
+                    },
+                )),
                 ssl_mode: None,
                 ssl_mode_secret: None,
                 set_role: None,
@@ -4286,10 +4285,12 @@ mod tests {
                 username_secret: None,
                 password: Some("static-password".into()),
                 password_secret: None,
-                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
-                    impersonate_service_account: None,
-                    scope: None,
-                }),
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity(
+                    GcpWorkloadIdentityAuth {
+                        impersonate_service_account: None,
+                        scope: None,
+                    },
+                )),
                 ssl_mode: None,
                 ssl_mode_secret: None,
                 set_role: None,
@@ -4319,10 +4320,12 @@ mod tests {
                 username_secret: None,
                 password: None,
                 password_secret: None,
-                auth: Some(ConnectionAuth::GcpWorkloadIdentity {
-                    impersonate_service_account: Some(" ".into()),
-                    scope: None,
-                }),
+                auth: Some(ConnectionAuth::GcpWorkloadIdentity(
+                    GcpWorkloadIdentityAuth {
+                        impersonate_service_account: Some(" ".into()),
+                        scope: None,
+                    },
+                )),
                 ssl_mode: None,
                 ssl_mode_secret: None,
                 set_role: None,
@@ -4534,9 +4537,12 @@ params:
         let auth = params.auth.as_ref().expect("auth should deserialize");
 
         assert!(params.password.is_none());
-        assert_eq!(auth.gcp_scope(), "https://example.com/custom-scope");
+        let ConnectionAuth::GcpWorkloadIdentity(gcp) = auth else {
+            panic!("expected GCP auth")
+        };
+        assert_eq!(gcp.gcp_scope(), "https://example.com/custom-scope");
         assert_eq!(
-            auth.gcp_impersonate_service_account(),
+            gcp.gcp_impersonate_service_account(),
             Some("target@other-project.iam.gserviceaccount.com")
         );
         assert!(conn.cache_key("prod").contains("gcp_workload_identity"));

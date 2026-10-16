@@ -85,6 +85,9 @@ when referenced in the policy, and verify its server-side mapping and executor
 privileges separately. See [operator connections](https://thepartly.github.io/pgroles/docs/operator-connections/#aks-workload-identity-for-azure-postgresql-flexible-server)
 for the full configuration. Azure policies share the Entra identity supplied by
 the operator pod environment; per-policy impersonation is not supported.
+Configuration is loaded once at startup; restart the operator after changing
+identity settings or `AZURE_AUTHORITY_HOST`. The assertion file is re-read on
+every exchange.
 
 Azure may attribute creator ADMIN memberships to `azuresu`; inspect and
 preserve their actual options. If CREATE ROLE followed by a self-ADMIN grant

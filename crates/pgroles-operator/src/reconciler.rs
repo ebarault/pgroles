@@ -689,7 +689,8 @@ fn retry_class_for_reconcile_error(error: &ReconcileError) -> RetryClass {
             }
             ContextError::GcpAuthRejected { .. }
             | ContextError::GcpAuthInvalidResponse { .. }
-            | ContextError::AzureAuth { .. } => {
+            | ContextError::AzureAuth(_)
+            | ContextError::AzureAuthConfiguration { .. } => {
                 if context.is_auth_non_transient() {
                     RetryClass::Slow
                 } else {
@@ -3801,7 +3802,9 @@ impl ReconcileError {
                 ContextError::GcpAuthHttp { .. }
                 | ContextError::GcpAuthRejected { .. }
                 | ContextError::GcpAuthInvalidResponse { .. } => "GcpAuthFailed",
-                ContextError::AzureAuth { .. } => "AzureAuthFailed",
+                ContextError::AzureAuth(_) | ContextError::AzureAuthConfiguration { .. } => {
+                    "AzureAuthFailed"
+                }
                 ContextError::DatabaseConnect { .. } => "DatabaseConnectionFailed",
                 ContextError::SetRoleFailed { .. } => "SetRoleFailed",
                 ContextError::EmptyResolvedValue { .. } => "InvalidConnectionParams",

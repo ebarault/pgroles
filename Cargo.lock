@@ -2224,7 +2224,6 @@ dependencies = [
  "pgroles-core",
  "pgroles-inspect",
  "predicates",
- "reqwest 0.12.28",
  "serde_json",
  "serde_yaml",
  "sqlx",

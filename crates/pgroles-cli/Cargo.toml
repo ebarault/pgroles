@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 pgroles-core = { workspace = true }
-pgroles-inspect = { workspace = true }
+pgroles-inspect = { workspace = true, features = ["azure"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 flate2 = "1.1.5"
@@ -27,7 +27,6 @@ jiff = "0.2.23"
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sqlx = { workspace = true }
-reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

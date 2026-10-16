@@ -199,8 +199,14 @@ creation separately, then adopt the existing membership and reconcile object
 grants. Treat this SQL-authority constraint separately when validating token
 authentication and policy convergence.
 
+The operator reads its Azure configuration once at startup and reuses its HTTP
+client. It re-reads the projected assertion on every token exchange.
+`AZURE_AUTHORITY_HOST` can override the default `https://login.microsoftonline.com/`
+with an HTTPS authority origin. Restart the operator after changing its identity
+or authority configuration.
+
 The CLI supports the same projected identity with
-`pgroles diff --azure-workload-identity --database-url 'postgres://pgroles-operator@myserver.postgres.database.azure.com/postgres?sslmode=verify-full'`.
+`pgroles diff --auth azure-workload-identity --database-url 'postgres://pgroles-operator@myserver.postgres.database.azure.com/postgres?sslmode=verify-full'`.
 The flag also applies to `apply`, `inspect`, `generate`, and current-state
 `graph`; omit a password from the connection URL. The CLI obtains a fresh
 access token for each invocation.

@@ -128,7 +128,7 @@ operator:
   # -- Annotations to add to the operator pod.
   podAnnotations: {}
 
-  # -- Additional pod labels. Set azure.workload.identity/use: "true" for AKS Workload Identity.
+  # -- Additional pod labels.
   podLabels: {}
 
   http:

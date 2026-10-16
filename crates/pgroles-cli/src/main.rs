@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use kube::api::{ApiResource, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::{Api, Client};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
@@ -45,17 +45,25 @@ use pgroles_inspect::InspectConfig;
 #[derive(Parser)]
 #[command(name = "pgroles", version, about, long_about = None)]
 struct Cli {
-    /// Use AKS Workload Identity for Azure PostgreSQL Flexible Server.
-    /// Requires AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE.
-    #[arg(long, global = true, env = "PGROLES_AZURE_WORKLOAD_IDENTITY")]
-    azure_workload_identity: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
-struct DatabaseConnection<'a> {
-    url: &'a str,
-    azure_workload_identity: bool,
+/// PostgreSQL settings shared only by commands that connect to a database.
+#[derive(clap::Args)]
+struct DatabaseArgs {
+    /// PostgreSQL connection string (or set DATABASE_URL).
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: String,
+
+    /// Obtain a short-lived password from a token provider.
+    #[arg(long, value_enum, env = "PGROLES_DATABASE_AUTH")]
+    auth: Option<DatabaseAuth>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum DatabaseAuth {
+    AzureWorkloadIdentity,
 }
 
 #[derive(Subcommand)]
@@ -83,9 +91,8 @@ enum Commands {
         #[arg(long, conflicts_with = "file")]
         bundle: Option<PathBuf>,
 
-        /// PostgreSQL connection string (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
+        #[command(flatten)]
+        database: DatabaseArgs,
 
         /// Output format: "sql" for raw SQL, "summary" for a brief summary, "json" for machine-readable JSON, "markdown" for a redacted review table.
         #[arg(long, default_value = "sql")]
@@ -140,9 +147,8 @@ enum Commands {
         #[arg(long, conflicts_with = "file")]
         bundle: Option<PathBuf>,
 
-        /// PostgreSQL connection string (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
+        #[command(flatten)]
+        database: DatabaseArgs,
 
         /// Print the SQL that would be executed without actually running it.
         #[arg(long)]
@@ -178,9 +184,8 @@ enum Commands {
         #[arg(long, conflicts_with = "file")]
         bundle: Option<PathBuf>,
 
-        /// PostgreSQL connection string (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
+        #[command(flatten)]
+        database: DatabaseArgs,
     },
 
     /// Generate a manifest YAML from the current database state (brownfield adoption).
@@ -188,9 +193,8 @@ enum Commands {
     /// Introspects all non-system roles, their grants, default privileges, and
     /// memberships, then emits a flat manifest that reproduces the current state.
     Generate {
-        /// PostgreSQL connection string (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
+        #[command(flatten)]
+        database: DatabaseArgs,
 
         /// Write output to this file instead of stdout.
         #[arg(short, long)]
@@ -370,9 +374,8 @@ enum GraphSource {
         #[arg(long, conflicts_with = "file")]
         bundle: Option<PathBuf>,
 
-        /// PostgreSQL connection string (or set DATABASE_URL).
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
+        #[command(flatten)]
+        database: DatabaseArgs,
 
         /// Which roles to include: "managed" (requires -f) or "all".
         #[arg(long, default_value = "managed")]
@@ -461,7 +464,6 @@ const LAST_HANDLED_RECONCILE_AT_STATUS_FIELD: &str = "lastHandledReconcileAt";
 const LAST_ATTEMPTED_RECONCILE_AT_STATUS_FIELD: &str = "lastAttemptedReconcileAt";
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let azure_workload_identity = cli.azure_workload_identity;
     match cli.command {
         Commands::Validate { file, bundle } => {
             cmd_validate(file.as_deref(), bundle.as_deref())?;
@@ -470,7 +472,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Diff {
             file,
             bundle,
-            database_url,
+            database,
             format,
             mode,
             exit_code,
@@ -484,10 +486,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_diff(
                 file.as_deref(),
                 bundle.as_deref(),
-                &DatabaseConnection {
-                    url: &database_url,
-                    azure_workload_identity,
-                },
+                &database,
                 &format,
                 ApplySettings {
                     mode: mode.into(),
@@ -506,7 +505,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Apply {
             file,
             bundle,
-            database_url,
+            database,
             dry_run,
             mode,
             allow_schema_owner_transfers,
@@ -514,10 +513,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             cmd_apply(
                 file.as_deref(),
                 bundle.as_deref(),
-                &DatabaseConnection {
-                    url: &database_url,
-                    azure_workload_identity,
-                },
+                &database,
                 dry_run,
                 mode.into(),
                 allow_schema_owner_transfers,
@@ -528,30 +524,19 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Inspect {
             file,
             bundle,
-            database_url,
+            database,
         } => {
-            cmd_inspect(
-                file.as_deref(),
-                bundle.as_deref(),
-                &DatabaseConnection {
-                    url: &database_url,
-                    azure_workload_identity,
-                },
-            )
-            .await?;
+            cmd_inspect(file.as_deref(), bundle.as_deref(), &database).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Generate {
-            database_url,
+            database,
             output,
             suggest_profiles,
             suggest_min_schemas,
         } => {
             cmd_generate(
-                &DatabaseConnection {
-                    url: &database_url,
-                    azure_workload_identity,
-                },
+                &database,
                 output.as_deref(),
                 suggest_profiles,
                 suggest_min_schemas,
@@ -612,7 +597,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             GraphSource::Current {
                 file,
                 bundle,
-                database_url,
+                database,
                 scope,
                 format,
                 output,
@@ -620,10 +605,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 cmd_graph_current(
                     file.as_deref(),
                     bundle.as_deref(),
-                    &DatabaseConnection {
-                        url: &database_url,
-                        azure_workload_identity,
-                    },
+                    &database,
                     &scope,
                     &format,
                     output.as_deref(),
@@ -1588,7 +1570,7 @@ fn finish_diff(
 async fn cmd_diff(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    connection: &DatabaseConnection<'_>,
+    connection: &DatabaseArgs,
     format: &OutputFormat,
     apply: ApplySettings,
     use_exit_code: bool,
@@ -1822,7 +1804,7 @@ async fn cmd_diff(
 async fn cmd_apply(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    connection: &DatabaseConnection<'_>,
+    connection: &DatabaseArgs,
     dry_run: bool,
     mode: ReconciliationMode,
     allow_schema_owner_transfers: bool,
@@ -2033,7 +2015,7 @@ async fn cmd_apply(
 async fn cmd_inspect(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    connection: &DatabaseConnection<'_>,
+    connection: &DatabaseArgs,
 ) -> Result<()> {
     // Validate manifest or bundle before connecting so YAML errors fail fast.
     let validated_manifest = match (file, bundle) {
@@ -2102,7 +2084,7 @@ async fn cmd_inspect(
 }
 
 async fn cmd_generate(
-    connection: &DatabaseConnection<'_>,
+    connection: &DatabaseArgs,
     output: Option<&Path>,
     suggest_profiles: bool,
     suggest_min_schemas: usize,
@@ -2285,7 +2267,7 @@ fn cmd_graph_desired(
 async fn cmd_graph_current(
     file: Option<&Path>,
     bundle: Option<&Path>,
-    connection: &DatabaseConnection<'_>,
+    connection: &DatabaseArgs,
     scope: &GraphScope,
     format: &GraphFormat,
     output: Option<&Path>,
@@ -2362,28 +2344,26 @@ fn write_output(content: &str, output: Option<&Path>) -> Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn connect_db(connection: &DatabaseConnection<'_>) -> Result<PgPool> {
+async fn connect_db(connection: &DatabaseArgs) -> Result<PgPool> {
     info!("connecting to database");
     // The CLI is a one-shot tool, so prefer a single pooled connection. This
     // avoids hopping across different backends when a hostname resolves to
     // multiple PostgreSQL servers.
-    let mut options =
-        PgConnectOptions::from_str(connection.url).context("invalid PostgreSQL connection URL")?;
-    if connection.azure_workload_identity {
-        let parsed = reqwest::Url::parse(connection.url)
-            .context("Azure authentication requires a PostgreSQL URL")?;
-        anyhow::ensure!(
-            parsed.password().is_none() && !parsed.query_pairs().any(|(key, _)| key == "password"),
-            "Azure Workload Identity requires a connection URL without a password"
-        );
-        if !parsed.query_pairs().any(|(key, _)| key == "sslmode") {
-            options = options.ssl_mode(PgSslMode::VerifyFull);
+    let options = match connection.auth {
+        None => PgConnectOptions::from_str(&connection.database_url)
+            .context("invalid PostgreSQL connection URL")?,
+        Some(DatabaseAuth::AzureWorkloadIdentity) => {
+            let options =
+                pgroles_inspect::azure_auth::connection_options(&connection.database_url)?;
+            let config = pgroles_inspect::azure_auth::WorkloadIdentityConfig::from_env()
+                .context("invalid Azure Workload Identity configuration")?;
+            let token = pgroles_inspect::azure_auth::AzureTokenSource::new(config)
+                .fetch()
+                .await
+                .context("could not acquire Azure PostgreSQL access token")?;
+            options.password(&token.value)
         }
-        let token = pgroles_inspect::azure_auth::fetch_workload_identity_token()
-            .await
-            .context("could not acquire Azure PostgreSQL access token")?;
-        options = options.password(&token.value);
-    }
+    };
     PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -2982,9 +2962,9 @@ mod tests {
             "postgres://operator:password@localhost/postgres",
             "postgres://operator@localhost/postgres?password=secret",
         ] {
-            let error = connect_db(&DatabaseConnection {
-                url,
-                azure_workload_identity: true,
+            let error = connect_db(&DatabaseArgs {
+                database_url: url.into(),
+                auth: Some(DatabaseAuth::AzureWorkloadIdentity),
             })
             .await
             .expect_err("Azure auth must reject a persistent password");
@@ -2999,9 +2979,9 @@ mod tests {
             .block_on(cmd_graph_current(
                 None,
                 None,
-                &DatabaseConnection {
-                    url: "postgres://unused",
-                    azure_workload_identity: false,
+                &DatabaseArgs {
+                    database_url: "postgres://unused".into(),
+                    auth: None,
                 },
                 &GraphScope::Managed,
                 &GraphFormat::Tree,
